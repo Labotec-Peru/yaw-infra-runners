@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""
+Revisa el contenido de una imagen Docker ANTES de cargarla en el demonio.
+
+  puyu-revisar <back|front> <ruta-del-tar>     -> 0 limpio, 1 rechazado
+
+Lee las capas con tarfile sin ejecutar nada y sin hacer 'docker load'. Lo que
+busca es lo que de verdad aparecio en los dos incidentes de este servidor:
+binarios plantados donde solo deberia haber un jar o HTML, bits setuid,
+nombres de mineros conocidos, y URLs de pools o descargas encadenadas a un
+shell.
+
+Lo que SI atrapa
+  - un ELF en /app, /tmp, /dev/shm o en el webroot
+  - cualquier setuid/setgid que no sea de los del sistema base
+  - nombres de mineros y proxyware conocidos (xmrig, perfctl, kdevtmpfsi...)
+  - stratum+tcp://, puertos de pool, 'curl ... | sh'
+  - scripts ejecutables metidos en el webroot de un front
+  - IPs publicas embebidas, incluidas las de dentro del jar
+
+Lo que NO atrapa, y conviene tenerlo claro
+  - codigo malicioso ofuscado dentro de clases Java
+  - una dependencia envenenada que se vea normal
+  - cualquier cosa que el atacante escriba en tiempo de ejecucion
+"""
+import io, os, re, sys, json, stat, tarfile, tempfile, zipfile, syslog, ipaddress
+
+MAX_TEXTO    = 4 * 1024**2        # no se escanea el contenido de nada mas grande
+MAX_TOTAL    = 3 * 1024**3        # tope de bytes leidos en total
+PERMITIDAS   = "/etc/puyu/ips-permitidas.txt"
+
+# Rutas donde un ejecutable nativo es normal (vienen de la imagen base).
+DIRS_ELF_OK = (
+    "bin/", "sbin/", "lib/", "lib64/", "libexec/",
+    "usr/bin/", "usr/sbin/", "usr/lib/", "usr/lib64/", "usr/libexec/",
+    "usr/local/bin/", "usr/local/sbin/", "usr/local/lib/",
+    "usr/glibc-compat/", "opt/java/", "opt/jdk/", "opt/openjdk/",
+    "etc/alternatives/", "etc/ssl/",
+)
+# Rutas donde un ejecutable nativo NO tiene nada que hacer.
+DIRS_PROHIBIDOS = (
+    "app/", "tmp/", "var/tmp/", "dev/shm/", "run/shm/", "home/", "root/",
+    "usr/share/nginx/html/", "var/www/", "srv/",
+)
+# Los pocos setuid legitimos de debian/alpine.
+SETUID_OK = {
+    "bin/su", "bin/mount", "bin/umount", "bin/ping", "bin/ping6", "bin/busybox",
+    "usr/bin/su", "usr/bin/sudo", "usr/bin/passwd", "usr/bin/chfn",
+    "usr/bin/chsh", "usr/bin/gpasswd", "usr/bin/newgrp", "usr/bin/expiry",
+    "usr/bin/chage", "usr/bin/wall", "usr/bin/mount", "usr/bin/umount",
+    "usr/bin/crontab", "usr/bin/at", "usr/bin/ssh-agent",
+    "sbin/unix_chkpwd", "sbin/pam_extrausers_chkpwd", "usr/sbin/unix_chkpwd",
+    "usr/lib/openssh/ssh-keysign", "usr/lib/dbus-1.0/dbus-daemon-launch-helper",
+    "usr/lib/polkit-1/polkit-agent-helper-1", "usr/lib/eject/dmcrypt-get-device",
+    "usr/lib/utempter/utempter",
+}
+# Rutas que las escribio el build, no la imagen base. Solo aqui una IP publica
+# bloquea el despliegue en modo estricto: una imagen base de 250 MB trae IPs
+# de ejemplo en documentacion, datos de zona horaria y fixtures de tests, y
+# rechazar por esas haria el modo estricto inservible.
+DIRS_DEL_BUILD = (
+    "app/", "usr/share/nginx/html/", "var/www/", "usr/share/caddy/",
+    "opt/app/", "srv/", "home/", "docker-entrypoint.d/",
+    "etc/nginx/conf.d/", "etc/nginx/nginx.conf",
+)
+
+# Extensiones que puede tener un frontend compilado.
+WEB_OK = {
+    ".html", ".htm", ".js", ".mjs", ".cjs", ".css", ".map", ".json", ".txt",
+    ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp",
+    ".woff", ".woff2", ".ttf", ".eot", ".otf", ".xml", ".webmanifest",
+    ".mp4", ".webm", ".mp3", ".wav", ".pdf", ".wasm", ".md", ".csv", ".gz",
+    ".br", ".yaml", ".yml", ".conf", "",
+}
+EJECUTABLES = {".sh", ".bash", ".zsh", ".php", ".py", ".pl", ".rb", ".cgi",
+               ".lua", ".jsp", ".asp", ".aspx", ".exe", ".bat", ".ps1", ".elf",
+               ".so", ".bin", ".run", ".out"}
+
+NOMBRES_MALOS = re.compile(
+    r"(?i)^(xmrig|xmrigdaemon|xmrigminer|xmr-stak|cpuminer|minerd|ccminer|"
+    r"ethminer|t-rex|nbminer|phoenixminer|lolminer|teamredminer|srbminer|"
+    r"perfctl|perfcc|kdevtmpfsi|kinsing|dbused|dbusex|wbin|wesobase|"
+    r"diicot|tsm|tsm32|tsm64|sysupdate|sysguard|networkservice|pwnrig|"
+    r"c3pool|nanopool|moneroocean|supportxmr|tor2web|proxyware|"
+    r"pnscan|masscan|zmap|haiduc|chrome-sandbox-helper)"
+    r"([.-].*)?$")
+
+IOC = [
+    (re.compile(rb"stratum\+(tcp|ssl|tcps)://", re.I),
+     "URL de pool de minado (stratum)"),
+    (re.compile(rb"\b(xmrig|minerd|cpuminer|moneroocean|supportxmr|c3pool|"
+                rb"nanopool\.org|pool\.minexmr|randomx)\b", re.I),
+     "referencia a software o pool de minado"),
+    (re.compile(rb"(curl|wget)\s[^|;&\n]{0,200}\|\s*(ba|z|da|)sh\b", re.I),
+     "descarga encadenada a un shell (curl|sh)"),
+    (re.compile(rb"\b(chattr\s+\+i|setsid\s|nohup\s+\./|LD_PRELOAD\s*=)", re.I),
+     "tecnica de persistencia u ocultamiento"),
+    (re.compile(rb":(3333|4444|5555|7777|8333|9999|14433|14444|45560|45700)\b"),
+     "puerto tipico de pool de minado"),
+    (re.compile(rb"/var/spool/cron|crontab\s+-|/etc/cron\.(d|daily|hourly)/", re.I),
+     "manipulacion de cron"),
+]
+RE_IP = re.compile(rb"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+leidos = 0
+IPS_VISTAS = set()
+hallazgos = []     # (gravedad, mensaje)  gravedad: 'rechaza' | 'aviso'
+
+
+def rechaza(m):
+    hallazgos.append(("rechaza", m))
+
+
+def aviso(m):
+    hallazgos.append(("aviso", m))
+
+
+def permitidas():
+    redes = [ipaddress.ip_network(x) for x in
+             ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+              "169.254.0.0/16", "100.64.0.0/10", "0.0.0.0/8", "224.0.0.0/4",
+              "240.0.0.0/4", "255.255.255.255/32")]
+    estricto = False
+    if os.path.isfile(PERMITIDAS):
+        estricto = True
+        for linea in open(PERMITIDAS, encoding="utf-8", errors="replace"):
+            linea = linea.split("#")[0].strip()
+            if linea:
+                try:
+                    redes.append(ipaddress.ip_network(linea, strict=False))
+                except ValueError:
+                    pass
+    return redes, estricto
+
+
+REDES_OK, ESTRICTO = permitidas()
+
+
+def ip_sospechosa(txt):
+    raras = set()
+    for m in RE_IP.finditer(txt):
+        s = m.group(1).decode()
+        try:
+            ip = ipaddress.ip_address(s)
+        except ValueError:
+            continue
+        if any(ip in r for r in REDES_OK):
+            continue
+        raras.add(s)
+    return raras
+
+
+# ───────────────────────── escaneo de una entrada ──────────────────────────
+
+def revisar_entrada(ti, datos, capa, tipo):
+    """datos puede ser None si la entrada es grande o no es regular."""
+    ruta = ti.name.lstrip("./")
+    base = os.path.basename(ruta)
+
+    if ".wh." in base:                       # whiteout de overlayfs
+        return
+    if not (ti.isfile() or ti.islnk() or ti.issym()):
+        return
+
+    # 1. nombres conocidos
+    if NOMBRES_MALOS.match(base):
+        rechaza(f"nombre de minero/proxyware conocido: /{ruta}  [capa {capa}]")
+        return
+
+    # 2. setuid / setgid
+    if ti.mode & (stat.S_ISUID | stat.S_ISGID) and ruta not in SETUID_OK:
+        rechaza(f"binario setuid/setgid no esperado: /{ruta} "
+                f"modo {oct(ti.mode)}  [capa {capa}]")
+
+    es_elf = bool(datos) and datos[:4] == b"\x7fELF"
+    ext = os.path.splitext(base)[1].lower()
+
+    # 3. ejecutables nativos donde no deben estar
+    if es_elf and ruta.startswith(DIRS_PROHIBIDOS):
+        rechaza(f"ejecutable nativo (ELF) fuera de sitio: /{ruta}  [capa {capa}]")
+    elif es_elf and not ruta.startswith(DIRS_ELF_OK):
+        aviso(f"ejecutable nativo en ruta inusual: /{ruta}  [capa {capa}]")
+
+    # 4. el webroot de un front: solo estatico
+    en_web = ruta.startswith(("usr/share/nginx/html/", "var/www/", "app/dist/",
+                              "usr/share/caddy/", "app/build/"))
+    if en_web:
+        if es_elf:
+            rechaza(f"ELF dentro del webroot: /{ruta}  [capa {capa}]")
+        elif ext in EJECUTABLES:
+            rechaza(f"script ejecutable en el webroot: /{ruta}  [capa {capa}]")
+        elif ext not in WEB_OK:
+            aviso(f"extension inesperada en el webroot: /{ruta}  [capa {capa}]")
+        if ti.mode & 0o111 and ext not in ("", ".sh"):
+            aviso(f"archivo estatico con bit de ejecucion: /{ruta}  [capa {capa}]")
+
+    # 5. en /app de un back: solo el jar y config
+    if tipo == "back" and ruta.startswith("app/"):
+        if ext in EJECUTABLES or es_elf:
+            rechaza(f"ejecutable en /app (solo deberia haber el jar): /{ruta} "
+                    f" [capa {capa}]")
+
+    # 6. cron
+    if ruta.startswith(("etc/cron", "var/spool/cron", "etc/periodic/")):
+        aviso(f"entrada de cron en la imagen: /{ruta}  [capa {capa}]")
+
+    # 7. contenido
+    if datos and not es_elf:
+        for rx, que in IOC:
+            if rx.search(datos):
+                rechaza(f"{que} en /{ruta}  [capa {capa}]")
+        raras = ip_sospechosa(datos)
+        if raras:
+            IPS_VISTAS.update(raras)
+            lista = ", ".join(sorted(raras)[:6])
+            if ESTRICTO and ruta.startswith(DIRS_DEL_BUILD):
+                rechaza(f"IP publica no autorizada en /{ruta}: {lista} "
+                        f"[capa {capa}]")
+            else:
+                aviso(f"IP publica embebida en /{ruta}: {lista}  [capa {capa}]")
+
+    # 8. dentro del jar
+    if ext == ".jar" and datos:
+        revisar_jar(ruta, datos, capa)
+
+
+def revisar_jar(ruta, datos, capa):
+    try:
+        z = zipfile.ZipFile(io.BytesIO(datos))
+    except (zipfile.BadZipFile, MemoryError):
+        aviso(f"no se pudo abrir el jar /{ruta} para revisarlo por dentro")
+        return
+    interesantes = (".properties", ".yml", ".yaml", ".xml", ".json", ".conf",
+                    ".sh", ".txt", ".env")
+    with z:
+        for n in z.namelist():
+            if n.endswith("/"):
+                continue
+            e = os.path.splitext(n)[1].lower()
+            if e in (".sh", ".so", ".exe", ".bin"):
+                rechaza(f"ejecutable dentro del jar: /{ruta}!{n}  [capa {capa}]")
+                continue
+            if e not in interesantes:
+                continue
+            try:
+                info = z.getinfo(n)
+                if info.file_size > 1024**2:
+                    continue
+                cont = z.read(n)
+            except (KeyError, RuntimeError, zipfile.BadZipFile, OSError):
+                continue
+            for rx, que in IOC:
+                if rx.search(cont):
+                    rechaza(f"{que} dentro del jar: /{ruta}!{n}  [capa {capa}]")
+            raras = ip_sospechosa(cont)
+            if raras:
+                IPS_VISTAS.update(raras)
+                lista = ", ".join(sorted(raras)[:6])
+                if ESTRICTO:
+                    rechaza(f"IP publica no autorizada dentro del jar "
+                            f"/{ruta}!{n}: {lista}")
+                else:
+                    aviso(f"IP publica dentro del jar /{ruta}!{n}: {lista}")
+
+
+# ───────────────────────────── recorrido ───────────────────────────────────
+
+def capas_del_tar(tar):
+    try:
+        m = tar.extractfile("manifest.json")
+        datos = json.loads(m.read())
+    except (KeyError, json.JSONDecodeError, TypeError):
+        print("ERROR: el tar no trae un manifest.json legible", file=sys.stderr)
+        sys.exit(1)
+    capas = []
+    for e in datos:
+        capas += e.get("Layers") or []
+    if not capas:
+        print("ERROR: el manifest no declara capas", file=sys.stderr)
+        sys.exit(1)
+    return capas
+
+
+def main():
+    global leidos
+    solo_ips = "--ips" in sys.argv
+    argv = [a for a in sys.argv if a != "--ips"]
+    if len(argv) != 3:
+        print("uso: puyu-revisar [--ips] <back|front> <tar>", file=sys.stderr)
+        print("     --ips  solo lista las IPs publicas encontradas, para "
+              "sembrar la lista", file=sys.stderr)
+        sys.exit(1)
+    tipo, ruta_tar = argv[1], argv[2]
+    if tipo not in ("back", "front"):
+        print(f"tipo invalido: {tipo}", file=sys.stderr)
+        sys.exit(1)
+
+    with tarfile.open(ruta_tar, "r") as tar:
+        capas = capas_del_tar(tar)
+        if ESTRICTO:
+            propias = len(REDES_OK) - 10
+            print(f"revisando {len(capas)} capas  (IPs: modo ESTRICTO, "
+                  f"{propias} entrada(s) en {PERMITIDAS})")
+            if propias == 0:
+                print(f"  aviso: {PERMITIDAS} esta vacio; cualquier IP publica "
+                      f"en el codigo del build rechazara el despliegue")
+        else:
+            print(f"revisando {len(capas)} capas  (IPs: modo permisivo, "
+                  f"no existe {PERMITIDAS})")
+
+        for n, nombre in enumerate(capas, 1):
+            try:
+                f = tar.extractfile(nombre)
+            except KeyError:
+                aviso(f"el manifest declara la capa {nombre} y no esta en el tar")
+                continue
+            if f is None:
+                continue
+            try:
+                with tarfile.open(fileobj=f, mode="r|*") as capa:
+                    for ti in capa:
+                        if leidos > MAX_TOTAL:
+                            aviso("se alcanzo el tope de bytes a revisar; "
+                                  "la revision quedo incompleta")
+                            break
+                        datos = None
+                        if ti.isfile() and 0 < ti.size <= MAX_TEXTO:
+                            ex = capa.extractfile(ti)
+                            if ex:
+                                datos = ex.read()
+                                leidos += len(datos)
+                        elif ti.isfile() and ti.size > MAX_TEXTO:
+                            ex = capa.extractfile(ti)
+                            if ex:
+                                datos = ex.read(4)   # solo la firma ELF
+                                leidos += ti.size
+                        revisar_entrada(ti, datos, n, tipo)
+            except tarfile.TarError as ex:
+                aviso(f"capa {n} ilegible ({ex}); no se pudo revisar")
+
+    if solo_ips:
+        if IPS_VISTAS:
+            print(f"\n# IPs publicas encontradas en la imagen.")
+            print(f"# Revisa cada una y pega las legitimas en {PERMITIDAS}:")
+            for ip in sorted(IPS_VISTAS, key=lambda x: [int(o) for o in x.split(".")]):
+                print(ip)
+        else:
+            print("\nninguna IP publica embebida")
+        sys.exit(0)
+
+    rechazos = [m for g, m in hallazgos if g == "rechaza"]
+    avisos   = [m for g, m in hallazgos if g == "aviso"]
+
+    for m in dict.fromkeys(avisos):
+        print(f"  aviso    {m}")
+    for m in dict.fromkeys(rechazos):
+        print(f"  RECHAZA  {m}", file=sys.stderr)
+
+    syslog.openlog("puyu-revisar", syslog.LOG_PID)
+    syslog.syslog(f"tipo={tipo} rechazos={len(set(rechazos))} "
+                  f"avisos={len(set(avisos))} bytes={leidos}")
+
+    if rechazos:
+        print(f"\nRECHAZADA: {len(set(rechazos))} hallazgo(s) que bloquean el "
+              f"despliegue. La imagen no se cargo.", file=sys.stderr)
+        sys.exit(1)
+    print(f"imagen limpia ({len(set(avisos))} aviso(s), "
+          f"{leidos // 1024**2} MB revisados)")
+
+
+if __name__ == "__main__":
+    main()

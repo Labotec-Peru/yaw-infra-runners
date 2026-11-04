@@ -1,0 +1,33 @@
+# IPs y rangos autorizados para aparecer escritos en el codigo de una imagen.
+#
+# Copiar a /etc/puyu/ips-permitidas.txt en el servidor.
+#
+#   el archivo NO existe  ->  modo permisivo: las IPs publicas solo se reportan
+#   el archivo SI existe  ->  modo ESTRICTO: una IP publica que no este aqui y
+#                             que este en una ruta del build (/app, el webroot,
+#                             dentro del jar) RECHAZA el despliegue
+#
+# No hace falta declarar las privadas: 10/8, 172.16/12, 192.168/16, 127/8,
+# 169.254/16, 100.64/10 y multicast ya estan permitidas de fabrica, asi que la
+# red de WireGuard (10.8.0.0/24) y los nombres de home-net no se tocan.
+#
+# Para sembrar la lista, corre el revisor en modo lista sobre una imagen que
+# ya sabes que es buena:
+#
+#   docker save mi-servicio:123 > /tmp/i.tar
+#   puyu-revisar --ips back /tmp/i.tar
+#
+# Revisa cada IP que salga ANTES de pegarla aqui. Si no sabes de quien es, no
+# la pegues: averigualo primero.
+
+# ── infraestructura propia ───────────────────────────────────────────────────
+5.189.180.249        # vmi3116730 - servicios, nginx, kong
+85.208.51.199        # vmi3119248 - jenkins
+
+# ── integraciones con IP fija ────────────────────────────────────────────────
+# Wialon y similares. Descomentar y verificar la direccion antes de confiar.
+# 193.193.165.165    # wialon - CONFIRMAR
+
+# ── NTP ──────────────────────────────────────────────────────────────────────
+# pool.ntp.org rota direcciones: si un firmware o una imagen trae una IP de
+# NTP escrita, mejor cambiarla por el nombre que agregarla aqui.

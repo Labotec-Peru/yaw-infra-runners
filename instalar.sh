@@ -3,11 +3,13 @@
 set -euo pipefail
 DESTINO="${1:?uso: ./instalar.sh <usuario@host>}"
 
-python3 -m py_compile bin/puyu-alta bin/puyu-deploy
+python3 -m py_compile bin/puyu-alta bin/puyu-deploy bin/puyu-revisar bin/puyu-token
 bash -n bin/servicio-init.sh
+sh -n bin/puyu-git-askpass
 echo "--- sintaxis OK"
 
-scp -O bin/puyu-alta bin/puyu-deploy bin/servicio-init.sh "$DESTINO":/tmp/
+scp -O bin/puyu-alta bin/puyu-deploy bin/puyu-revisar bin/puyu-token \
+  bin/puyu-git-askpass bin/servicio-init.sh "$DESTINO":/tmp/
 
 ssh "$DESTINO" '
   set -e
@@ -22,14 +24,15 @@ ssh "$DESTINO" '
   }
   install -d -m 700 -o jenkins -g jenkins /home/jenkins/.ssh
 
-  for f in puyu-alta puyu-deploy servicio-init.sh; do
+  for f in puyu-alta puyu-deploy puyu-revisar puyu-token puyu-git-askpass servicio-init.sh; do
     install -m 755 -o root -g root "/tmp/$f" "/usr/local/bin/$f"
     rm -f "/tmp/$f"
   done
-  python3 -m py_compile /usr/local/bin/puyu-alta /usr/local/bin/puyu-deploy
+  python3 -m py_compile /usr/local/bin/puyu-alta /usr/local/bin/puyu-deploy \
+    /usr/local/bin/puyu-revisar /usr/local/bin/puyu-token
 
   cat > /etc/sudoers.d/jenkins-alta <<SUDO
-Defaults:jenkins env_keep += "SSH_CLIENT SSH_CONNECTION"
+Defaults:jenkins env_keep += "SSH_CLIENT SSH_CONNECTION SSH_ORIGINAL_COMMAND"
 jenkins ALL=(root) NOPASSWD: /usr/local/bin/servicio-init.sh
 SUDO
   chmod 440 /etc/sudoers.d/jenkins-alta
@@ -48,10 +51,15 @@ cat <<'FIN'
 
 Falta, una sola vez en el servidor:
 
-  # 1. llave de solo lectura del repo privado (deploy key en GitHub, SIN escritura)
-  ssh-keygen -t ed25519 -f /root/.ssh/puyu-runners -N "" -C "puyu-runners-readonly"
-  cat /root/.ssh/puyu-runners.pub      # -> Settings > Deploy keys del repo
-  ssh-keyscan github.com >> /root/.ssh/known_hosts
+  # 1. GitHub App de solo lectura (la org bloqueo las deploy keys).
+  #    Ya subiste el .pem a /root/.ssh/puyu-runners-app.pem; completa los
+  #    IDs (pagina de la app en Developer settings, y la URL de Install):
+  cat > /etc/puyu/github-app.conf <<CONF
+APP_ID=TU_APP_ID
+INSTALL_ID=TU_INSTALL_ID
+PEM=/root/.ssh/puyu-runners-app.pem
+CONF
+  chmod 600 /etc/puyu/github-app.conf
 
   # 2. firmantes autorizados de los commits
   echo "gabriel@labotec ssh-ed25519 AAAA..." > /etc/puyu/allowed_signers

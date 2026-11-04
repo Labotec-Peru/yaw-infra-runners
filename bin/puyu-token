@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""
+Genera el token de instalacion de la GitHub App de Puyu (acceso de SOLO
+LECTURA al repo privado de runners). Labotec-Peru deshabilito las deploy
+keys: este es el reemplazo.
+
+  puyu-token        -> imprime un token valido por stdout
+
+Flujo: firma un JWT (RS256) con la clave privada de la app, pide un token de
+instalacion a la API de GitHub y lo cachea en /var/lib/puyu/token (root 600)
+hasta 5 minutos antes de expirar. Git lo pide varias veces por accion (una
+por prompt) y no conviene pegarle a la API en cada uno.
+
+El token NUNCA viaja en la linea de comandos: lo entrega puyu-git-askpass
+directo a git. En ps/logs solo se ve la URL sin credenciales.
+
+Config en /etc/puyu/github-app.conf (root 600):
+  APP_ID=123456
+  INSTALL_ID=12345678
+  PEM=/root/.ssh/puyu-runners-app.pem
+"""
+import base64, json, os, sys, syslog, time
+import subprocess, urllib.request, urllib.error
+
+CONF    = "/etc/puyu/github-app.conf"
+TOKEN_F = "/var/lib/puyu/token"
+MARGEN  = 300          # renovar 5 minutos antes de expirar
+IP      = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
+
+
+def log(m):
+    syslog.openlog("puyu-token", syslog.LOG_PID)
+    syslog.syslog(f"ip={IP} {m}")
+
+
+def morir(m):
+    log(f"RECHAZADO {m}")
+    print(f"ERROR: {m}", file=sys.stderr)
+    sys.exit(1)
+
+
+def b64u(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def conf():
+    if not os.path.isfile(CONF):
+        morir(f"falta {CONF} (APP_ID, INSTALL_ID, PEM)")
+    st = os.stat(CONF)
+    if st.st_uid != 0 or st.st_mode & 0o077:
+        morir(f"{CONF} debe ser root 600")
+
+    d = {}
+    for linea in open(CONF, encoding="utf-8", errors="replace"):
+        linea = linea.split("#")[0].strip()
+        if not linea or "=" not in linea:
+            continue
+        k, v = linea.split("=", 1)
+        d[k.strip()] = v.strip()
+
+    for k in ("APP_ID", "INSTALL_ID", "PEM"):
+        if not d.get(k):
+            morir(f"{CONF}: falta {k}")
+    pem = d["PEM"]
+    st = os.stat(pem)
+    if st.st_uid != 0 or st.st_mode & 0o077:
+        morir(f"{pem} debe ser root 600")
+    return d["APP_ID"], d["INSTALL_ID"], pem
+
+
+def cacheado(ahora):
+    try:
+        with open(TOKEN_F) as f:
+            datos = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(datos, dict):
+        return None
+    if datos.get("exp") and datos["exp"] - MARGEN > ahora:
+        return datos.get("token")
+    return None
+
+
+def pedir_token(app_id, install_id, pem):
+    ahora = int(time.time())
+    cab = b64u(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
+    cue = b64u(json.dumps({"iat": ahora - 60, "exp": ahora + 540,
+                           "iss": int(app_id)}).encode())
+    firma = subprocess.run(
+        ["openssl", "dgst", "-sha256", "-sign", pem, "-binary"],
+        input=f"{cab}.{cue}".encode(), capture_output=True)
+    if firma.returncode != 0:
+        morir(f"openssl no pudo firmar el JWT: {firma.stderr.decode()[:200]}")
+    jwt = f"{cab}.{cue}.{b64u(firma.stdout)}"
+
+    req = urllib.request.Request(
+        f"https://api.github.com/app/installations/{install_id}/access_tokens",
+        method="POST",
+        headers={"Authorization": f"Bearer {jwt}",
+                 "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            datos = json.loads(r.read())
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            json.JSONDecodeError, OSError) as ex:
+        morir(f"la API de GitHub rechazo el pedido: {str(ex)[:200]}")
+
+    token = datos.get("token")
+    if not token:
+        morir("la API no devolvio un token")
+
+    os.makedirs("/var/lib/puyu", mode=0o700, exist_ok=True)
+    fd = os.open(TOKEN_F, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({"token": token, "exp": ahora + 3600}, f)
+    log("token de instalacion generado")
+    return token
+
+
+def main():
+    app_id, install_id, pem = conf()
+    t = cacheado(time.time())
+    if t:
+        print(t)
+        return
+    print(pedir_token(app_id, install_id, pem))
+
+
+if __name__ == "__main__":
+    main()

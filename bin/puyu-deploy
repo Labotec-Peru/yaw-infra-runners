@@ -1,24 +1,86 @@
 #!/usr/bin/env python3
 """
-Despliega un servicio. Lo invoca servicio-init.sh, nunca el cliente directamente.
+Despliega el contenedor de un servicio. Lo invoca servicio-init.sh.
 
-  puyu-deploy desplegar <servicio> <dev|prod>   < imagen.tar
-  puyu-deploy estado    <servicio> <dev|prod>
-  puyu-deploy registro  <servicio> <dev|prod>
-  puyu-deploy revertir  <servicio> <dev|prod>
+  desplegar <servicio> <dev|prod> [clave=valor ...]   (tar de la imagen por stdin)
+  estado    <servicio> <dev|prod>
+  registro  <servicio> <dev|prod>
+  revertir  <servicio> <dev|prod>
 
-El YAML se lee de $PUYU_SERVICIOS (el cache que dejo la accion "rutas").
+estado y registro son solo lectura: no reciben parametros ni los necesitan.
+revertir tampoco recibe parametros del pipeline: re-arranca el contenedor con
+la imagen :previo usando la config EXACTA del ultimo deploy exitoso, guardada
+en /var/lib/puyu/cfg/.
+
+De donde sale cada cosa
+-----------------------
+Del PIPELINE (devops/vars/<entorno>.vars.yml, via los pares clave=valor):
+    tipo puertos env mem reserva cpus pids java_opts salud reintentos conservar
+
+Del REGISTRO (servicios.yaml, solo esto):
+    que el servicio este declarado. Nada de construccion: servicios.yaml es
+    rutas de Kong y carpetas, no un plan de despliegue.
+
+Antes de cargar la imagen se la pasa a puyu-revisar, que recorre las capas
+buscando binarios plantados, setuid, nombres de mineros y URLs de pools. Si
+el revisor rechaza, no se hace docker load y el contenedor viejo sigue vivo.
+
+Fijo aqui (el pipeline no lo elige nunca):
+    la red, --cap-drop ALL, no-new-privileges, --read-only de los back,
+    el uid, y que TODOS los puertos se publiquen en 127.0.0.1 y nada mas.
+
+No existe ninguna combinacion de parametros que abra un puerto en la IP
+publica. Lo unico que escucha afuera son el 80 y el 443 de nginx. Si un
+servicio necesita que le lleguen por TCP crudo desde internet, eso se abre
+a mano en el servidor, fuera de este script y fuera del pipeline.
 """
-import os, re, sys, json, time, fcntl, shutil, syslog, hashlib, tarfile, tempfile, subprocess, yaml
+import os, re, sys, json, time, fcntl, socket, shutil, syslog
+import hashlib, tarfile, tempfile, subprocess, urllib.request, urllib.error
+import yaml
 
-YAMLF        = os.environ.get("PUYU_SERVICIOS", "/var/lib/puyu/servicios.yaml")
-RED          = "home-net"
-LOCK         = "/run/puyu-deploy.lock"
-MAX_TAR      = 2 * 1024**3
-MIN_TAR      = 1 * 1024**2
-MARGEN       = 5 * 1024**3
-TIMEOUT      = 300
-IP           = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
+RED      = "home-net"
+LOCK     = "/run/puyu-deploy.lock"
+REGISTRO = os.environ.get("PUYU_SERVICIOS", "/var/lib/puyu/servicios.yaml")
+TMPDIR   = "/var/lib/puyu"
+MAX_TAR  = 2 * 1024**3
+MIN_TAR  = 1 * 1024**2
+MARGEN   = 5 * 1024**3
+TIMEOUT  = 600
+IP       = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
+
+NOMBRE_OK  = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}$")
+ENTORNO_OK = re.compile(r"^(dev|prod)$")
+TAG_OK     = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,95}:[A-Za-z0-9._-]{1,64}$")
+CFG_DIR    = "/var/lib/puyu/cfg"
+
+# Lista blanca de lo que el pipeline puede mandar. Lo que no este aqui se
+# rechaza: un parametro nuevo se agrega con un PR a este repo privado.
+REGLAS = {
+    "tipo":       r"front|back",
+    "puertos":    r"\d{2,5}(:\d{2,5})?(,\d{2,5}(:\d{2,5})?){0,7}",
+    "env":        r"/home/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.env",
+    "mem":        r"\d{1,5}[mg]",
+    "reserva":    r"\d{1,5}[mg]",
+    "cpus":       r"[0-9](\.[0-9])?",
+    "pids":       r"\d{2,4}",
+    "java_opts":  r"[-A-Za-z0-9=:.,%+]{1,256}",
+    "salud":      r"/[A-Za-z0-9._/-]{0,96}",
+    "reintentos": r"\d{1,3}",
+    "conservar":  r"\d{1,2}",
+}
+# Nunca llegan del pipeline: son la frontera de seguridad.
+# 'http' y 'tcp' quedan prohibidos a proposito: ya no existe la distincion.
+# Docker no sabe que protocolo corre por un puerto -- HTTP es TCP -- asi que
+# lo unico que importaba era 0.0.0.0 vs 127.0.0.1, y aqui SIEMPRE es loopback.
+PROHIBIDOS = ("nombre", "entorno", "uid", "red", "network", "imagen",
+              "http", "tcp", "publicar", "host",
+              "privileged", "volumen", "mount", "cap_add", "user")
+
+BASE = {
+    "back":  {"mem": "1g",   "reserva": "512m", "cpus": "1",   "pids": "512", "uid": "10001"},
+    "front": {"mem": "256m", "reserva": "128m", "cpus": "0.5", "pids": "256", "uid": None},
+}
+TOPES = {"cpus": 8.0, "pids": 4096}
 
 
 def log(m):
@@ -32,61 +94,118 @@ def morir(m):
     sys.exit(1)
 
 
-def docker(*args, timeout=TIMEOUT):
+def docker(*a, timeout=TIMEOUT):
     try:
-        return subprocess.run(["docker", *args], capture_output=True,
+        return subprocess.run(["docker", *a], capture_output=True,
                               text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        morir(f"docker {args[0]} excedio {timeout}s")
+        morir(f"docker {a[0]} excedio {timeout}s")
 
 
-def cargar(nombre, ent):
+def existe(cont):
+    return docker("inspect", cont).returncode == 0
+
+
+# ──────────────────────── parametros del pipeline ───────────────────────────
+
+def parsear(args):
+    p = {}
+    for a in args:
+        if "=" not in a:
+            morir(f"parametro malformado: {a!r}")
+        k, v = a.split("=", 1)
+        if k in PROHIBIDOS:
+            morir(f"'{k}' no lo elige el pipeline")
+        if k not in REGLAS:
+            morir(f"parametro no permitido: {k!r} "
+                  f"(soportados: {', '.join(sorted(REGLAS))})")
+        if not re.fullmatch(REGLAS[k], v):
+            morir(f"valor invalido para {k}: {v!r}")
+        if k in p:
+            morir(f"parametro repetido: {k}")
+        p[k] = v
+
+    tipo = p.get("tipo", "back")
+    cfg = dict(BASE[tipo])
+    cfg["tipo"] = tipo
+    for k in ("mem", "reserva", "cpus", "pids"):
+        if k in p:
+            cfg[k] = p[k]
+    cfg["salud"]      = p.get("salud")
+    cfg["java_opts"]  = p.get("java_opts", "")
+    cfg["reintentos"] = int(p.get("reintentos", 45))
+    cfg["conservar"]  = int(p.get("conservar", 3))
+
+    if float(cfg["cpus"]) > TOPES["cpus"]:
+        morir(f"cpus fuera de rango: {cfg['cpus']} (tope {TOPES['cpus']})")
+    if int(cfg["pids"]) > TOPES["pids"]:
+        morir(f"pids fuera de rango: {cfg['pids']} (tope {TOPES['pids']})")
+    if not (1 <= cfg["reintentos"] <= 120):
+        morir(f"reintentos fuera de rango: {cfg['reintentos']}")
+
+    if tipo == "back":
+        if "puertos" not in p:
+            morir("falta puertos= (obligatorio para tipo=back)")
+        if "env" not in p:
+            morir("falta env= (obligatorio para tipo=back)")
+        cfg["env"] = p["env"]
+        cfg["puertos"] = []
+        for par in p["puertos"].split(","):
+            t = par.split(":")
+            host, dentro = (t[0], t[1]) if len(t) == 2 else (t[0], t[0])
+            # El lado del host nunca privilegiado. El de dentro del contenedor
+            # si puede ser bajo: un nginx dentro escucha en el 80 y el namespace
+            # de red es otro.
+            if not (1024 <= int(host) <= 65535):
+                morir(f"puerto de host fuera de rango: {host} (1024-65535)")
+            if not (1 <= int(dentro) <= 65535):
+                morir(f"puerto de contenedor fuera de rango: {dentro}")
+            if host in [h for h, _ in cfg["puertos"]]:
+                morir(f"puerto de host repetido: {host}")
+            cfg["puertos"].append((host, dentro))
+    else:
+        if cfg["java_opts"]:
+            morir("java_opts no aplica a tipo=front")
+        if "puertos" in p:
+            morir("un front no publica puertos: el nginx del host lo alcanza "
+                  f"por nombre en la red {RED}")
+        cfg["puertos"] = []
+        cfg["env"] = p.get("env")
+
+    return cfg
+
+
+# ─────────────────── el registro: solo membresia ────────────────────────────
+
+def declarado(nombre, entorno):
+    """servicios.yaml NO aporta construccion. Solo responde si el servicio
+    existe con ese entorno, para que el pipeline no pueda inventarse un nombre
+    y pisar un contenedor que no le toca (kong, nginx, postgres...)."""
+    if not os.path.isfile(REGISTRO):
+        morir(f"no hay registro en {REGISTRO}; corre 'rutas' primero")
+    if os.stat(REGISTRO).st_uid != 0:
+        morir(f"{REGISTRO} no pertenece a root")
     try:
-        d = yaml.safe_load(open(YAMLF)) or {}
-    except Exception as ex:
-        morir(f"no se pudo leer {YAMLF}: {ex}")
+        with open(REGISTRO, "rb") as f:
+            datos = yaml.safe_load(f) or {}
+    except yaml.YAMLError as ex:
+        morir(f"registro ilegible: {str(ex)[:200]}")
 
-    svc = next((s for s in d.get("servicios") or [] if s.get("nombre") == nombre), None)
+    svcs = datos.get("servicios") or []
+    svc = next((s for s in svcs if s.get("nombre") == nombre), None)
     if svc is None:
-        morir(f"servicio desconocido: {nombre}")
-    if "despliegue" not in svc:
-        morir(f"{nombre} no declara bloque 'despliegue'")
-    e = (svc.get("entornos") or {}).get(ent)
-    if not e:
-        morir(f"{nombre} no declara el entorno {ent}")
-    return svc, e
+        morir(f"'{nombre}' no esta declarado en servicios.yaml. Agregalo con un "
+              f"PR a puyu-routes y corre el job de rutas. "
+              f"Declarados: {', '.join(sorted(s.get('nombre','?') for s in svcs))}")
+    ents = svc.get("entornos") or {}
+    if entorno not in ents:
+        morir(f"'{nombre}' no declara el entorno '{entorno}' "
+              f"(declarados: {', '.join(sorted(ents)) or 'ninguno'})")
 
 
-def validar(svc, e):
-    dep = svc["despliegue"]
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", dep.get("imagen", "")):
-        morir(f"imagen invalida: {dep.get('imagen')!r}")
-    uid = dep.get("uid", 10001)
-    if not isinstance(uid, int) or not (1000 <= uid <= 65533):
-        morir(f"uid invalido: {uid!r}")
-
-    for campo in ("http", "mem", "cpus", "env"):
-        if campo not in e:
-            morir(f"falta '{campo}' en el entorno")
-
-    p = e["http"]
-    if not isinstance(p, int) or isinstance(p, bool) or not (1024 <= p <= 65535):
-        morir(f"puerto http invalido: {p!r}")
-
-    t = e.get("tcp", "-")
-    if str(t) != "-" and (not isinstance(t, int) or not (1024 <= t <= 65535)):
-        morir(f"puerto tcp invalido: {t!r}")
-
-    if not re.fullmatch(r"\d+[mg]", str(e["mem"])):
-        morir(f"memoria invalida: {e['mem']!r}")
-    if not re.fullmatch(r"\d+(\.\d+)?", str(e["cpus"])) or float(e["cpus"]) > 8:
-        morir(f"cpus invalido: {e['cpus']!r}")
-
-    ruta = e["env"]
-    if not re.fullmatch(r"/home/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.env", ruta):
-        morir(f"env invalido: {ruta!r}")
+def validar_env(ruta):
     if os.path.islink(ruta):
-        morir("el env no puede ser un enlace simbolico")
+        morir("el .env no puede ser un enlace simbolico")
     if not os.path.isfile(ruta):
         morir(f"no existe {ruta}")
     st = os.stat(ruta)
@@ -98,10 +217,47 @@ def validar(svc, e):
         morir(f"{ruta} tiene permisos {oct(st.st_mode & 0o777)}, debe ser 600")
 
 
-def etiqueta_del_tar(ruta, esperada):
+# ───────────────── config guardada para revertir ────────────────────────────
+
+def guardar_cfg(cont, cfg):
+    """El pipeline no manda parametros a 'revertir': se re-arranca con la
+    config exacta del ultimo deploy EXITOSO, persistida aqui (root 600)."""
+    os.makedirs(CFG_DIR, mode=0o700, exist_ok=True)
+    datos = dict(cfg)
+    datos["puertos"] = [[h, d] for h, d in cfg.get("puertos", [])]
+    tmp = f"{CFG_DIR}/.{cont}.json.tmp"
+    with open(tmp, "w") as f:
+        json.dump(datos, f, sort_keys=True)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, f"{CFG_DIR}/{cont}.json")
+
+
+def cargar_cfg(cont):
+    ruta_cfg = f"{CFG_DIR}/{cont}.json"
+    if not os.path.isfile(ruta_cfg):
+        morir(f"no hay config guardada para {cont}: el ultimo deploy exitoso "
+              f"no la dejo ({ruta_cfg}). Haz un deploy para regenerarla y "
+              f"luego revertir.")
+    st = os.stat(ruta_cfg)
+    if st.st_uid != 0 or st.st_mode & 0o077:
+        morir(f"{ruta_cfg} no pertenece a root o tiene permisos laxos")
+    try:
+        with open(ruta_cfg) as f:
+            datos = json.load(f)
+    except (json.JSONDecodeError, OSError) as ex:
+        morir(f"{ruta_cfg} ilegible: {str(ex)[:200]}")
+    if not isinstance(datos, dict) or datos.get("tipo") not in ("back", "front"):
+        morir(f"{ruta_cfg} corrupto: falta un tipo valido")
+    datos["puertos"] = [(int(h), int(d)) for h, d in datos.get("puertos", [])]
+    return datos
+
+
+# ─────────────────────────────── el tar ─────────────────────────────────────
+
+def etiqueta_del_tar(ruta):
     """Lee manifest.json SIN cargar la imagen en el demonio."""
     try:
-        with tarfile.open(ruta, "r") as t:
+        with tarfile.open(ruta, "r") as t:        # descomprime gzip solo
             m = t.extractfile("manifest.json")
             if m is None:
                 morir("el tar no contiene manifest.json")
@@ -110,30 +266,47 @@ def etiqueta_del_tar(ruta, esperada):
         morir(f"el archivo no es un tar valido: {ex}")
     except KeyError:
         morir("el tar no parece una imagen de Docker")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        morir("manifest.json corrupto")
 
     tags = []
-    for entrada in datos:
-        tags += entrada.get("RepoTags") or []
-    if not tags:
-        morir("la imagen del tar no trae etiqueta")
+    for e in datos:
+        tags += e.get("RepoTags") or []
     if len(tags) != 1:
-        morir(f"el tar trae {len(tags)} imagenes, se espera 1: {tags}")
-
-    base = tags[0].split(":")[0].split("/")[-1]
-    if base != esperada:
-        morir(f"la imagen del tar es '{tags[0]}', se esperaba '{esperada}'")
+        morir(f"el tar trae {len(tags)} imagenes, se espera exactamente 1: {tags}")
+    if not TAG_OK.match(tags[0]):
+        morir(f"etiqueta de imagen invalida: {tags[0]!r}")
     return tags[0]
 
 
-def recibir_tar(esperada):
-    tmpdir = "/var/lib/puyu"
-    libre = shutil.disk_usage(tmpdir).free
-    if libre < MAX_TAR + MARGEN:
-        morir(f"disco insuficiente: {libre // 1024**2} MB libres")
+def revisar_imagen(ruta, tipo):
+    """Revisa el contenido de la imagen ANTES de cargarla en el demonio.
+    Si falta el revisor se aborta: fallar abierto aqui es no revisar nada."""
+    rev = "/usr/local/bin/puyu-revisar"
+    if not os.path.isfile(rev):
+        os.remove(ruta)
+        morir(f"falta {rev}; sin revisor no se despliega")
+    try:
+        r = subprocess.run([sys.executable, "-I", rev, tipo, ruta],
+                           capture_output=True, text=True, timeout=900)
+    except subprocess.TimeoutExpired:
+        os.remove(ruta)
+        morir("la revision de la imagen excedio 900s")
+    print(r.stdout, end="")
+    if r.returncode != 0:
+        print(r.stderr, end="", file=sys.stderr)
+        os.remove(ruta)
+        morir("la imagen no paso la revision de contenido; no se cargo")
 
-    fd, ruta = tempfile.mkstemp(dir=tmpdir, prefix="img-", suffix=".tar")
+
+def recibir_tar():
+    os.makedirs(TMPDIR, mode=0o700, exist_ok=True)
+    if shutil.disk_usage(TMPDIR).free < MAX_TAR + MARGEN:
+        morir("disco insuficiente")
+
+    fd, ruta = tempfile.mkstemp(dir=TMPDIR, prefix="img-", suffix=".tar")
     os.fchmod(fd, 0o600)
-    n = 0
+    n, h = 0, hashlib.sha256()
     with os.fdopen(fd, "wb") as f:
         while True:
             b = sys.stdin.buffer.read(1 << 20)
@@ -143,58 +316,157 @@ def recibir_tar(esperada):
             if n > MAX_TAR:
                 os.remove(ruta)
                 morir(f"la imagen supera {MAX_TAR // 1024**2} MB")
+            h.update(b)
             f.write(b)
-
     if n < MIN_TAR:
         os.remove(ruta)
         morir(f"la imagen pesa {n} bytes, demasiado poco")
 
-    tag = etiqueta_del_tar(ruta, esperada)
-    h = hashlib.sha256(open(ruta, "rb").read(1 << 24)).hexdigest()[:16]
-    print(f"imagen recibida: {n} bytes  tag={tag}  sha256:{h}")
-    return ruta, tag, h
+    tag = etiqueta_del_tar(ruta)
+    sha = h.hexdigest()[:16]
+    print(f"imagen recibida: {n} bytes  tag={tag}  sha256:{sha}")
+    return ruta, tag, sha
 
 
-def correr(svc, e, cont, tag):
-    dep = svc["despliegue"]
-    puertos = ["-p", f"127.0.0.1:{e['http']}:{e['http']}"]
-    if str(e.get("tcp", "-")) != "-":
-        puertos += ["-p", f"0.0.0.0:{e['tcp']}:{e['tcp']}"]
+# ──────────────────────────── el contenedor ─────────────────────────────────
 
-    return docker("run", "-d",
-                  "--name", cont,
-                  "--restart", "always",
-                  "--network", RED,
-                  "--env-file", e["env"],
-                  "--user", str(dep.get("uid", 10001)),
-                  *puertos,
-                  f"--memory={e['mem']}",
-                  f"--cpus={e['cpus']}",
-                  "--pids-limit", "512",
-                  "--security-opt", "no-new-privileges:true",
-                  "--cap-drop", "ALL",
-                  "--read-only",
-                  "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
-                  "--log-driver", "json-file",
-                  "--log-opt", "max-size=50m", "--log-opt", "max-file=3",
-                  tag)
+def arrancar(cfg, cont, tag):
+    cmd = ["run", "-d", "--name", cont,
+           "--restart", "always",
+           "--network", RED,
+           "--security-opt", "no-new-privileges:true",
+           "--cap-drop", "ALL",
+           f"--memory={cfg['mem']}",
+           f"--memory-reservation={cfg['reserva']}",
+           f"--cpus={cfg['cpus']}",
+           "--pids-limit", cfg["pids"],
+           "--log-driver", "json-file",
+           "--log-opt", "max-size=50m", "--log-opt", "max-file=3"]
 
+    if cfg["env"]:
+        cmd += ["--env-file", cfg["env"]]
+
+    if cfg["tipo"] == "back":
+        # SIEMPRE 127.0.0.1. No hay forma de pedir 0.0.0.0 desde el pipeline:
+        # si un puerto tiene que quedar publico se abre a mano en el servidor.
+        for host_p, cont_p in cfg["puertos"]:
+            cmd += ["-p", f"127.0.0.1:{host_p}:{cont_p}"]
+        cmd += ["--user", cfg["uid"],
+                "--read-only",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m"]
+        if cfg["java_opts"]:
+            cmd += ["-e", "JAVA_TOOL_OPTIONS=" + cfg["java_opts"].replace(",", " ")]
+    else:
+        # Imagen con nginx dentro. No publica puertos. nginx escribe cache, pid
+        # y temporales, y hace chown/setuid al bajar de privilegio: por eso los
+        # tmpfs y esas tres capacidades en lugar de --read-only.
+        cmd += ["--cap-add", "CHOWN", "--cap-add", "SETUID", "--cap-add", "SETGID",
+                "--tmpfs", "/var/cache/nginx:rw,nosuid,size=64m",
+                "--tmpfs", "/var/run:rw,nosuid,size=4m",
+                "--tmpfs", "/tmp:rw,noexec,nosuid,size=32m"]
+
+    cmd.append(tag)
+    return docker(*cmd)
+
+
+def destino(cfg, cont):
+    """back -> 127.0.0.1:<puerto host>; front -> IP del contenedor en la red:80."""
+    if cfg["tipo"] == "back":
+        return "127.0.0.1", int(cfg["puertos"][0][0])
+    r = docker("inspect", "-f",
+               '{{(index .NetworkSettings.Networks "' + RED + '").IPAddress}}', cont)
+    ip = (r.stdout or "").strip()
+    return (ip, 80) if ip else (None, None)
+
+
+def sano(cfg, cont):
+    host, puerto = destino(cfg, cont)
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, puerto), timeout=2):
+            pass
+    except OSError:
+        return False
+    if not cfg["salud"]:
+        return True                 # el puerto acepta conexiones: suficiente
+    try:
+        with urllib.request.urlopen(
+                f"http://{host}:{puerto}{cfg['salud']}", timeout=3) as r:
+            if not (200 <= r.status < 300):
+                return False
+            return b'"status":"DOWN"' not in r.read(4096)
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def esperar(cfg, cont, intentos=None):
+    intentos = intentos or cfg["reintentos"]
+    print(f"health check: {cont} (max {intentos} x 2s)")
+    for i in range(intentos):
+        if docker("inspect", "-f", "{{.State.Status}}", cont).stdout.strip() != "running":
+            print(f"  !! {cont} dejo de correr en el intento {i + 1}")
+            return False
+        if sano(cfg, cont):
+            print(f"  OK en el intento {i + 1}")
+            return True
+        time.sleep(2)
+    return False
+
+
+def purgar(base, tag_actual, conservar):
+    r = docker("images", base, "--format", "{{.Tag}}")
+    viejos = [t for t in (r.stdout or "").split()
+              if t not in (tag_actual, "previo", "<none>")]
+    for t in viejos[conservar:]:
+        print(f"  borrando {base}:{t}")
+        docker("rmi", f"{base}:{t}")
+
+
+def rollback(cfg, cont, viejo):
+    print("!! ── ROLLBACK ──", file=sys.stderr)
+    docker("stop", "-t", "10", cont)
+    docker("rm", "-f", cont)
+    if not existe(viejo):
+        log(f"ROLLBACK IMPOSIBLE {cont}: no existe {viejo}")
+        print(f"!! no existe {viejo}: sin version anterior que restaurar",
+              file=sys.stderr)
+        return
+    docker("rename", viejo, cont)
+    docker("start", cont)
+    if esperar(cfg, cont, intentos=15):
+        log(f"ROLLBACK OK {cont}")
+        print("!! rollback OK: la version anterior esta viva y responde",
+              file=sys.stderr)
+    else:
+        log(f"ROLLBACK FALLIDO {cont}")
+        print("!! ROLLBACK FALLIDO: el servicio puede estar caido", file=sys.stderr)
+
+
+# ─────────────────────────────── entrada ────────────────────────────────────
 
 def main():
     os.umask(0o077)
+    if len(sys.argv) < 4:
+        morir("uso: puyu-deploy <desplegar|estado|registro|revertir> "
+              "<servicio> <dev|prod> [clave=valor ...]")
 
-    if len(sys.argv) != 4:
-        morir("uso: puyu-deploy <accion> <servicio> <dev|prod>")
-    accion, nombre, ent = sys.argv[1:4]
+    accion, nombre, entorno = sys.argv[1], sys.argv[2], sys.argv[3]
     if accion not in ("desplegar", "estado", "registro", "revertir"):
         morir(f"accion no permitida: {accion}")
-    if ent not in ("dev", "prod"):
-        morir("entorno debe ser dev o prod")
+    if not NOMBRE_OK.match(nombre):
+        morir(f"nombre de servicio invalido: {nombre!r}")
+    if not ENTORNO_OK.match(entorno):
+        morir(f"entorno invalido: {entorno!r}")
 
-    svc, e = cargar(nombre, ent)
-    cont = nombre if ent == "prod" else nombre + "-dev"
-    imagen = svc["despliegue"]["imagen"]
+    declarado(nombre, entorno)
 
+    cont  = nombre if entorno == "prod" else f"{nombre}-dev"
+    viejo = f"{cont}_old"
+
+    # estado y registro son solo lectura: no reciben parametros del pipeline
+    # ni necesitan config de arranque. (Antes parsear() exigia puertos=/env=
+    # tambien aqui y toda consulta moria con "falta puertos=".)
     if accion == "estado":
         r = docker("inspect", "-f",
                    "{{.Name}} estado={{.State.Status}} reinicios={{.RestartCount}} "
@@ -215,57 +487,86 @@ def main():
     except BlockingIOError:
         morir("hay otro despliegue en curso")
 
-    validar(svc, e)
+    if accion == "desplegar":
+        cfg = parsear(sys.argv[4:])
+    else:  # revertir: la config del ultimo deploy exitoso, no la del pipeline
+        if sys.argv[4:]:
+            morir("revertir no admite parametros: re-arranca con la config "
+                  "del ultimo deploy exitoso")
+        cfg = cargar_cfg(cont)
 
+    if cfg.get("env"):
+        validar_env(cfg["env"])
+
+    # ── un _old huerfano de un despliegue que murio a la mitad ──
+    if existe(viejo):
+        if existe(cont):
+            print(f"aviso: {viejo} huerfano de un deploy anterior; lo elimino")
+            docker("rm", "-f", viejo)
+        else:
+            print(f"aviso: deploy anterior interrumpido. {viejo} es la ultima "
+                  f"version buena: la restauro antes de seguir")
+            docker("rename", viejo, cont)
+            docker("start", cont)
+
+    ruta = None
     if accion == "revertir":
-        if docker("image", "inspect", f"{imagen}:previo").returncode:
-            morir("no hay imagen previa guardada")
-        docker("stop", "-t", "20", cont)
-        docker("rm", cont)
-        r = correr(svc, e, cont, f"{imagen}:previo")
-        if r.returncode:
-            morir(f"no se pudo revertir: {r.stderr.strip()[:200]}")
-        log(f"revertido {cont}")
-        print(f"OK revertido {cont}")
-        return
-
-    ruta, tag, h = recibir_tar(imagen)
-
-    previo = docker("inspect", "-f", "{{.Image}}", cont).stdout.strip()
-    if previo:
-        docker("tag", previo, f"{imagen}:previo")
-
-    r = docker("load", "-i", ruta)
-    os.remove(ruta)
-    if r.returncode:
-        morir(f"docker load fallo: {r.stderr.strip()[:200]}")
-
-    docker("stop", "-t", "20", cont)
-    docker("rm", cont)
-
-    r = correr(svc, e, cont, tag)
-    if r.returncode:
-        morir(f"docker run fallo: {r.stderr.strip()[:300]}")
-
-    estable = False
-    for _ in range(15):
-        time.sleep(2)
-        est = docker("inspect", "-f", "{{.State.Status}}", cont).stdout.strip()
-        if est != "running":
-            break
+        actual = docker("inspect", "-f", "{{.Config.Image}}", cont).stdout.strip()
+        if not actual:
+            morir(f"no existe el contenedor {cont}")
+        base, tag, sha = actual.split(":")[0], f"{actual.split(':')[0]}:previo", "-"
+        if docker("image", "inspect", tag).returncode:
+            morir(f"no hay imagen previa guardada ({tag})")
     else:
-        estable = True
+        ruta, tag, sha = recibir_tar()
+        base = tag.split(":")[0]
+        revisar_imagen(ruta, cfg["tipo"])
 
-    if estable:
-        log(f"desplegado {cont} tag={tag} sha256={h}")
-        print(f"OK {cont} running  tag={tag}  sha256:{h}")
-        return
+    # ── guardar la imagen viva como :previo ANTES de tocar nada ──
+    if accion == "desplegar":
+        vivo = docker("inspect", "-f", "{{.Image}}", cont).stdout.strip()
+        if vivo:
+            docker("tag", vivo, f"{base}:previo")
 
-    log(f"FALLO {cont} estado={est} sha256={h}")
-    print(f"FALLO: {cont} quedo en estado '{est}'", file=sys.stderr)
-    print(docker("logs", "--tail", "40", cont).stderr[-3000:], file=sys.stderr)
-    print(f"revertir con: revertir {nombre} {ent}", file=sys.stderr)
-    sys.exit(1)
+    if ruta:
+        r = docker("load", "-i", ruta)
+        os.remove(ruta)
+        if r.returncode:
+            morir(f"docker load fallo: {r.stderr.strip()[:300]}")
+
+    # ── despliegue atomico por renombrado ──
+    if existe(cont):
+        docker("stop", "-t", "20", cont)
+        docker("rename", cont, viejo)
+    else:
+        print("no hay contenedor previo: despliegue inicial")
+
+    r = arrancar(cfg, cont, tag)
+    if r.returncode:
+        print(f"docker run fallo: {r.stderr.strip()[:300]}", file=sys.stderr)
+        rollback(cfg, cont, viejo)
+        sys.exit(1)
+
+    if not esperar(cfg, cont):
+        print("!! health check fallo", file=sys.stderr)
+        print("── ultimas 150 lineas ──", file=sys.stderr)
+        lg = docker("logs", "--tail", "150", cont)
+        print((lg.stdout or "")[-6000:], file=sys.stderr)
+        print((lg.stderr or "")[-6000:], file=sys.stderr)
+        rollback(cfg, cont, viejo)
+        sys.exit(1)
+
+    if existe(viejo):
+        docker("rm", "-f", viejo)
+
+    if accion == "desplegar":
+        guardar_cfg(cont, cfg)
+
+    purgar(base, tag.split(":", 1)[1], cfg["conservar"])
+    pts = ",".join(f"{h}:{d}" for h, d in cfg["puertos"]) or "-"
+    log(f"{accion} {cont} tipo={cfg['tipo']} tag={tag} sha256={sha} "
+        f"mem={cfg['mem']} cpus={cfg['cpus']} puertos={pts}")
+    print(f"OK {cont} running  tipo={cfg['tipo']}  tag={tag}  sha256:{sha}")
 
 
 if __name__ == "__main__":

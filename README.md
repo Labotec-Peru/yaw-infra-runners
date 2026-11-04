@@ -25,6 +25,15 @@ en `Labotec-Peru/puyu-routes`.
 | `registro <svc> <ent>` | — | ultimas 50 lineas |
 | `revertir <svc> <ent>` | — | vuelve a la imagen `:previo` |
 
+`estado` y `registro` son solo lectura y no reciben parametros. `revertir`
+tampoco: re-arranca el contenedor con la config exacta del ultimo deploy
+exitoso, guardada por `puyu-deploy` en `/var/lib/puyu/cfg/<contenedor>.json`
+(root 600).
+
+> El sudoers de jenkins debe preservar `SSH_ORIGINAL_COMMAND` (`env_keep`),
+> ademas de `SSH_CLIENT` y `SSH_CONNECTION`: sin ella, `sudo` la borra y el
+> menu ve el comando vacio. `instalar.sh` ya la incluye.
+
 ## Por que los runners corren como root
 
 Un usuario que puede ejecutar Docker **es** root en el host: el socket no tiene
@@ -46,6 +55,21 @@ Firmar desde tu PC:
     git config --global gpg.format ssh
     git config --global user.signingkey ~/.ssh/firma-puyu.pub
     git config --global commit.gpgsign true
+
+## Acceso al repo (GitHub App)
+
+Labotec-Peru deshabilito las deploy keys. El acceso de solo lectura es una
+**GitHub App** instalada unicamente en este repo (permission `Contents:
+Read`). El token de instalacion lo genera `puyu-token` (JWT RS256 con la
+clave privada de la app + API de GitHub) y lo cachea en `/var/lib/puyu/token`
+(root 600) hasta 5 minutos antes de expirar. `puyu-git-askpass` se lo entrega
+a git: el token **nunca** aparece en la linea de comandos ni en `ps`.
+
+Config en `/etc/puyu/github-app.conf` (root 600):
+
+    APP_ID=123456
+    INSTALL_ID=12345678
+    PEM=/root/.ssh/puyu-runners-app.pem
 
 ## Validaciones
 
