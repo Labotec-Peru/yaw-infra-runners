@@ -28,7 +28,9 @@ en `Labotec-Peru/puyu-routes`.
 `estado` y `registro` son solo lectura y no reciben parametros. `revertir`
 tampoco: re-arranca el contenedor con la config exacta del ultimo deploy
 exitoso, guardada por `puyu-deploy` en `/var/lib/puyu/cfg/<contenedor>.json`
-(root 600).
+(root 600). Si el health check falla en el PRIMER despliegue (sin version
+anterior), el contenedor se deja corriendo para inspeccion en vez de
+eliminarlo.
 
 > El sudoers de jenkins debe preservar `SSH_ORIGINAL_COMMAND` (`env_keep`),
 > ademas de `SSH_CLIENT` y `SSH_CONNECTION`: sin ella, `sudo` la borra y el

@@ -553,6 +553,16 @@ def main():
         lg = docker("logs", "--tail", "150", cont)
         print((lg.stdout or "")[-6000:], file=sys.stderr)
         print((lg.stderr or "")[-6000:], file=sys.stderr)
+        if not existe(viejo):
+            # Primer despliegue: no hay version anterior que restaurar, asi que
+            # un rollback solo destruiria el unico contenedor. Se deja corriendo
+            # para inspeccionarlo (estado/registro) en vez de matar el deploy.
+            log(f"SIN HEALTH PERO VIVO {cont}: primer despliegue sin version "
+                f"anterior; el contenedor queda corriendo")
+            print("!! primer despliegue sin version anterior: el contenedor "
+                  "queda corriendo para inspeccion. Usa 'estado' y 'registro' "
+                  "para ver si termino de arrancar.", file=sys.stderr)
+            sys.exit(1)
         rollback(cfg, cont, viejo)
         sys.exit(1)
 
