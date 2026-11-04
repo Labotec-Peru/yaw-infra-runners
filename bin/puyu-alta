@@ -1,0 +1,224 @@
+#!/usr/bin/env python3
+"""
+Reconcilia servicios.yaml (recibido por stdin) contra el servidor.
+Crea lo que falta, corrige lo que difiere, NO borra nada.
+
+En el servidor:
+  /usr/local/bin/puyu-alta        root:root 755
+  authorized_keys de jenkins:
+    command="sudo -n /usr/local/bin/puyu-alta",restrict ssh-ed25519 AAAA...
+
+Desde Jenkins:
+  ssh -i key jenkins@servidor < servicios.yaml
+"""
+import os, re, sys, json, hashlib, syslog, urllib.request, urllib.error, yaml
+
+ADMIN      = os.environ.get("KONG_ADMIN", "http://127.0.0.1:8001")
+HOSTS      = {"prod": "apisprod.puyu-iot.com", "dev": "apisdev.puyu-iot.com"}
+DOMINIO    = ".puyu-iot.com"
+PLUGINS_OK = {"rate-limiting", "cors", "key-auth", "ip-restriction",
+              "request-size-limiting", "bot-detection"}
+MAX_YAML   = 256 * 1024
+MAX_SVCS   = 100
+IP         = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
+
+creados, actualizados, sin_cambios, errores = [], [], [], []
+
+
+def log(m):
+    syslog.openlog("puyu-alta", syslog.LOG_PID)
+    syslog.syslog(f"ip={IP} {m}")
+
+
+def morir(m):
+    log(f"ABORTADO {m}")
+    print(f"ERROR: {m}", file=sys.stderr)
+    sys.exit(1)
+
+
+def api(metodo, ruta, cuerpo=None):
+    datos = json.dumps(cuerpo).encode() if cuerpo is not None else None
+    req = urllib.request.Request(ADMIN + ruta, data=datos, method=metodo,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as ex:
+        return ex.code, json.loads(ex.read() or b"{}")
+    except urllib.error.URLError as ex:
+        morir(f"Kong no responde en {ADMIN}: {ex.reason}")
+
+
+# --------------------------- validacion ------------------------------------
+
+def validar(svc):
+    if not isinstance(svc, dict):
+        morir("entrada de servicio malformada")
+
+    n = svc.get("nombre", "")
+    if not isinstance(n, str) or not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,48}", n):
+        morir(f"nombre invalido: {n!r}")
+
+    kp = svc.get("kong_path") or ""
+    if kp and not re.fullmatch(r"/[A-Za-z0-9/_-]{0,64}", kp):
+        morir(f"[{n}] kong_path invalido: {kp!r}")
+
+    for p in svc.get("plugins") or []:
+        if p not in PLUGINS_OK:
+            morir(f"[{n}] plugin no permitido: {p!r} "
+                  f"(permitidos: {', '.join(sorted(PLUGINS_OK))})")
+
+    ents = svc.get("entornos")
+    if not isinstance(ents, dict) or not ents:
+        morir(f"[{n}] no declara entornos")
+
+    for ent, e in ents.items():
+        if ent not in ("dev", "prod"):
+            morir(f"[{n}] entorno invalido: {ent!r}")
+        if not isinstance(e, dict):
+            morir(f"[{n}/{ent}] entorno malformado")
+
+        ruta = e.get("env", "")
+        if not re.fullmatch(r"/home/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.env", ruta or ""):
+            morir(f"[{n}/{ent}] env debe ser /home/<servicio>/<entorno>/.env: {ruta!r}")
+        if ".." in ruta:
+            morir(f"[{n}/{ent}] ruta con '..': {ruta}")
+
+        if kp:
+            p = e.get("http")
+            if not isinstance(p, int) or isinstance(p, bool) or not (1024 <= p <= 65535):
+                morir(f"[{n}/{ent}] puerto http invalido: {p!r}")
+            h = e.get("kong_host") or HOSTS[ent]
+            if not isinstance(h, str) or not h.endswith(DOMINIO):
+                morir(f"[{n}/{ent}] host fuera del dominio propio: {h!r}")
+            if not re.fullmatch(r"[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9-]+)+", h):
+                morir(f"[{n}/{ent}] host malformado: {h!r}")
+
+
+# ------------------------- reconciliacion ----------------------------------
+
+def paths(nombre, ent, e):
+    ruta = e["env"]
+    carpeta = os.path.dirname(ruta)
+
+    if os.path.islink(carpeta) or os.path.islink(ruta):
+        errores.append(f"{nombre}/{ent}: enlace simbolico en {ruta}")
+        return
+
+    os.makedirs(carpeta, mode=0o755, exist_ok=True)
+
+    if os.path.exists(ruta):
+        st = os.stat(ruta)
+        if not os.path.isfile(ruta):
+            errores.append(f"{nombre}/{ent}: {ruta} no es un archivo regular")
+        elif st.st_mode & 0o077:
+            os.chmod(ruta, 0o600)
+            actualizados.append(f"{nombre}/{ent}: permisos del .env -> 600")
+        else:
+            sin_cambios.append(f"{nombre}/{ent}: .env ya existe ({st.st_size} bytes)")
+    else:
+        os.close(os.open(ruta, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600))
+        creados.append(f"{nombre}/{ent}: .env creado vacio -> {ruta}")
+
+
+def kong(svc, ent, e):
+    kp = svc.get("kong_path") or ""
+    if not kp:
+        return
+
+    nombre_k = svc["nombre"] if ent == "prod" else svc["nombre"] + "-dev"
+    ruta_k   = f"{nombre_k}-route"
+    host     = e.get("kong_host") or HOSTS[ent]
+    strip    = bool(svc.get("strip_path", True))
+
+    st, actual = api("GET", f"/services/{nombre_k}")
+    nuevo   = (st == 404)
+    difiere = st == 200 and (actual.get("host") != nombre_k or actual.get("port") != e["http"])
+
+    st, _ = api("PUT", f"/services/{nombre_k}", {
+        "name": nombre_k, "host": nombre_k, "port": e["http"], "protocol": "http",
+        "connect_timeout": 10000, "read_timeout": 60000, "write_timeout": 60000})
+    if st not in (200, 201):
+        errores.append(f"{nombre_k}: Kong rechazo el servicio (HTTP {st})")
+        return
+    if nuevo:
+        creados.append(f"{nombre_k}: servicio Kong -> {nombre_k}:{e['http']}")
+    elif difiere:
+        actualizados.append(f"{nombre_k}: servicio Kong -> {nombre_k}:{e['http']}")
+
+    st, actual_r = api("GET", f"/routes/{ruta_k}")
+    nueva     = (st == 404)
+    difiere_r = st == 200 and (actual_r.get("hosts") != [host]
+                               or actual_r.get("paths") != [kp]
+                               or actual_r.get("strip_path") != strip)
+
+    st, _ = api("PUT", f"/services/{nombre_k}/routes/{ruta_k}", {
+        "name": ruta_k, "hosts": [host], "paths": [kp],
+        "strip_path": strip, "protocols": ["https"]})
+    if st not in (200, 201):
+        errores.append(f"{ruta_k}: Kong rechazo la ruta (HTTP {st})")
+        return
+    if nueva:
+        creados.append(f"{ruta_k}: ruta Kong -> {host}{kp}")
+    elif difiere_r:
+        actualizados.append(f"{ruta_k}: ruta Kong -> {host}{kp}")
+
+    st, ps = api("GET", f"/routes/{ruta_k}/plugins")
+    ya = {p["name"] for p in ps.get("data", [])} if st == 200 else set()
+    for p in svc.get("plugins") or []:
+        if p in ya:
+            continue
+        st, _ = api("POST", f"/routes/{ruta_k}/plugins", {"name": p})
+        if st in (200, 201):
+            creados.append(f"{ruta_k}: plugin {p}")
+        else:
+            errores.append(f"{ruta_k}: plugin {p} fallo (HTTP {st})")
+
+
+# ------------------------------ entrada ------------------------------------
+
+def main():
+    os.umask(0o077)
+
+    crudo = sys.stdin.buffer.read(MAX_YAML + 1)
+    if not crudo:
+        morir("no se recibio servicios.yaml por stdin")
+    if len(crudo) > MAX_YAML:
+        morir(f"servicios.yaml supera {MAX_YAML // 1024} KB")
+
+    try:
+        datos = yaml.safe_load(crudo.decode("utf-8")) or {}
+    except (yaml.YAMLError, UnicodeDecodeError) as ex:
+        morir(f"yaml invalido: {str(ex)[:200]}")
+
+    svcs = datos.get("servicios")
+    if not isinstance(svcs, list) or not svcs:
+        morir("servicios.yaml no declara una lista 'servicios'")
+    if len(svcs) > MAX_SVCS:
+        morir(f"demasiados servicios: {len(svcs)}")
+
+    h = hashlib.sha256(crudo).hexdigest()[:16]
+    print(f"recibido: {len(crudo)} bytes  sha256:{h}  {len(svcs)} servicios\n")
+
+    for svc in svcs:
+        validar(svc)
+
+    for svc in svcs:
+        for ent, e in svc["entornos"].items():
+            paths(svc["nombre"], ent, e)
+            kong(svc, ent, e)
+
+    for titulo, lista in (("CREADO", creados), ("ACTUALIZADO", actualizados),
+                          ("SIN CAMBIOS", sin_cambios), ("ERROR", errores)):
+        if lista:
+            print(f"===== {titulo} ({len(lista)})")
+            for x in lista:
+                print(f"  {x}")
+
+    log(f"sha256={h} servicios={len(svcs)} creados={len(creados)} "
+        f"actualizados={len(actualizados)} errores={len(errores)}")
+    sys.exit(1 if errores else 0)
+
+
+if __name__ == "__main__":
+    main()
