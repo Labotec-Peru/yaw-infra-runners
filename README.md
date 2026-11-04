@@ -46,15 +46,10 @@ puede invocar es este menu.
 
 ## Autoactualizacion
 
-Antes de cada accion se trae este repo y se reinstalan los binarios. **El commit
-debe estar firmado** por alguien de `/etc/puyu/allowed_signers`: sin eso, quien
+Antes de cada accion se trae este repo y se reinstalan los binarios, con el
+token de solo lectura de la GitHub App (ver abajo). El acceso de ESCRITURA al
+repo sigue siendo la frontera: cuida quien puede pushear a main, porque quien
 controle el repositorio controla root en el servidor.
-
-Firmar desde tu PC:
-
-    git config --global gpg.format ssh
-    git config --global user.signingkey ~/.ssh/firma-puyu.pub
-    git config --global commit.gpgsign true
 
 ## Acceso al repo (GitHub App)
 

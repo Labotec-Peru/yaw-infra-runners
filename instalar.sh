@@ -61,15 +61,15 @@ PEM=/root/.ssh/puyu-runners-app.pem
 CONF
   chmod 600 /etc/puyu/github-app.conf
 
-  # 2. firmantes autorizados de los commits
-  echo "gabriel@labotec ssh-ed25519 AAAA..." > /etc/puyu/allowed_signers
-
-  # 3. llave de Jenkins, atada al menu
+  # 2. llave de Jenkins, atada al menu
   ssh-keygen -t ed25519 -f /root/jenkins-alta -N "" -C "jenkins-alta"
   echo "command=\"sudo -n /usr/local/bin/servicio-init.sh\",restrict $(cat /root/jenkins-alta.pub)" \
     > /home/jenkins/.ssh/authorized_keys
-  chown jenkins:jenkins /home/jenkins/.ssh/authorized_keys
-  chmod 600 /home/jenkins/.ssh/authorized_keys
+  # root es el dueno: si comprometen al usuario jenkins no puede reescribir su
+  # propia authorized_keys para quitar el restrict. OJO: sshd la lee como el
+  # USUARIO jenkins (privsep), no como root: por eso debe quedar LEGIBLE (644).
+  chown root:root /home/jenkins/.ssh/authorized_keys
+  chmod 644 /home/jenkins/.ssh/authorized_keys
   cat /root/jenkins-alta               # -> credencial puyu-alta en Jenkins
   shred -u /root/jenkins-alta
 FIN

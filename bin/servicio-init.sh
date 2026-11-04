@@ -36,9 +36,10 @@ actualizar_bins() {
   else
     git -C "$REPO_DIR" fetch --quiet --tags origin \
       || morir "no se pudo actualizar el repo"
-    git -C "$REPO_DIR" reset --hard --quiet origin/main \
-      || morir "no se pudo posicionar en main"
   fi
+
+  git -C "$REPO_DIR" reset --hard --quiet origin/main \
+    || morir "no se pudo posicionar en main"
 
   local commit; commit=$(git -C "$REPO_DIR" rev-parse --short HEAD)
 

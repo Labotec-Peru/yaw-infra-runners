@@ -100,6 +100,18 @@ IOC = [
     (re.compile(rb"/var/spool/cron|crontab\s+-|/etc/cron\.(d|daily|hourly)/", re.I),
      "manipulacion de cron"),
 ]
+
+# Archivos de la imagen base donde UN patron IOC concreto aparece de forma
+# legitima (falsos positivos conocidos). Solo ESE patron se rebaja a 'aviso'
+# en ESE archivo: cualquier otro hallazgo ahi sigue rechazando.
+IOC_EXENTOS = {
+    # registro de applets de busybox (alpine): contiene la palabra 'setsid'
+    "etc/busybox-paths.d/busybox": ("tecnica de persistencia u ocultamiento",),
+    # el usuario 'cron' del sistema tiene home /var/spool/cron
+    "etc/passwd":  ("manipulacion de cron",),
+    "etc/passwd-": ("manipulacion de cron",),
+}
+
 RE_IP = re.compile(rb"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
 
 leidos = 0
@@ -208,7 +220,10 @@ def revisar_entrada(ti, datos, capa, tipo):
     if datos and not es_elf:
         for rx, que in IOC:
             if rx.search(datos):
-                rechaza(f"{que} en /{ruta}  [capa {capa}]")
+                if que in IOC_EXENTOS.get(ruta, ()):
+                    aviso(f"{que} en /{ruta} (patron exento en archivo de la imagen base)  [capa {capa}]")
+                else:
+                    rechaza(f"{que} en /{ruta}  [capa {capa}]")
         raras = ip_sospechosa(datos)
         if raras:
             IPS_VISTAS.update(raras)
@@ -324,12 +339,18 @@ def main():
                                   "la revision quedo incompleta")
                             break
                         datos = None
-                        if ti.isfile() and 0 < ti.size <= MAX_TEXTO:
+                        # Los fat jar de Spring Boot pasan de 100 MB: sin leerlos
+                        # completos no se puede revisar su interior.
+                        limite = MAX_TEXTO
+                        base = os.path.basename(ti.name.lstrip("./"))
+                        if os.path.splitext(base)[1].lower() == ".jar":
+                            limite = 512 * 1024**2
+                        if ti.isfile() and 0 < ti.size <= limite:
                             ex = capa.extractfile(ti)
                             if ex:
                                 datos = ex.read()
                                 leidos += len(datos)
-                        elif ti.isfile() and ti.size > MAX_TEXTO:
+                        elif ti.isfile() and ti.size > limite:
                             ex = capa.extractfile(ti)
                             if ex:
                                 datos = ex.read(4)   # solo la firma ELF
