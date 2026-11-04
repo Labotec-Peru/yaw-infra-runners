@@ -66,6 +66,18 @@ Config en `/etc/puyu/github-app.conf` (root 600):
     INSTALL_ID=12345678
     PEM=/root/.ssh/puyu-runners-app.pem
 
+## Ajustes sin tocar el codigo (/etc/puyu)
+
+Los falsos positivos del revisor de imagenes se ajustan desde archivos de
+config en el servidor — un solo lugar, sin editar binarios:
+
+| Archivo | Controla |
+|---|---|
+| `/etc/puyu/ips-permitidas.txt` | IPs/redes permitidas en el codigo. Si existe → modo ESTRICTO |
+| `/etc/puyu/ioc-exentos.txt` | Exenciones IOC por `ruta \| patron`. Si no existe → defaults internos |
+
+Ambos archivos de ejemplo viven en `etc/` de este repo.
+
 ## Validaciones
 
 | Campo | Regla |

@@ -1,0 +1,20 @@
+# Exenciones IOC: falsos positivos conocidos de las imagenes base.
+# Copiar a /etc/puyu/ioc-exentos.txt en el servidor para ajustar sin tocar codigo.
+#
+# Formato por linea:  <ruta-en-el-tar> | <nombre-exacto-del-patron>
+#
+# Patrones validos (nombre exacto que imprime puyu-revisar):
+#   URL de pool de minado (stratum)
+#   referencia a software o pool de minado
+#   descarga encadenada a un shell (curl|sh)
+#   tecnica de persistencia u ocultamiento
+#   puerto tipico de pool de minado
+#   manipulacion de cron
+#
+# Si el archivo NO existe en el servidor, se usan los defaults internos.
+# Si existe (aunque este vacio), manda el archivo.
+#
+# ── imagen base alpine (eclipse-temurin) ─────────────────────────────────────
+etc/busybox-paths.d/busybox | tecnica de persistencia u ocultamiento
+etc/passwd | manipulacion de cron
+etc/passwd- | manipulacion de cron

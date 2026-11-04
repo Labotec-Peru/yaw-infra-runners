@@ -61,6 +61,9 @@ PEM=/root/.ssh/puyu-runners-app.pem
 CONF
   chmod 600 /etc/puyu/github-app.conf
 
+  # 1b. (opcional) exenciones del revisor de imagenes (ver README "Ajustes"):
+  #     cp etc/ioc-exentos.txt /etc/puyu/ioc-exentos.txt
+
   # 2. llave de Jenkins, atada al menu
   ssh-keygen -t ed25519 -f /root/jenkins-alta -N "" -C "jenkins-alta"
   echo "command=\"sudo -n /usr/local/bin/servicio-init.sh\",restrict $(cat /root/jenkins-alta.pub)" \
