@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""
+Despliega un servicio. Lo invoca servicio-init.sh, nunca el cliente directamente.
+
+  puyu-deploy desplegar <servicio> <dev|prod>   < imagen.tar
+  puyu-deploy estado    <servicio> <dev|prod>
+  puyu-deploy registro  <servicio> <dev|prod>
+  puyu-deploy revertir  <servicio> <dev|prod>
+
+El YAML se lee de $PUYU_SERVICIOS (el cache que dejo la accion "rutas").
+"""
+import os, re, sys, json, time, fcntl, shutil, syslog, hashlib, tarfile, tempfile, subprocess, yaml
+
+YAMLF        = os.environ.get("PUYU_SERVICIOS", "/var/lib/puyu/servicios.yaml")
+RED          = "home-net"
+LOCK         = "/run/puyu-deploy.lock"
+MAX_TAR      = 2 * 1024**3
+MIN_TAR      = 1 * 1024**2
+MARGEN       = 5 * 1024**3
+TIMEOUT      = 300
+IP           = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
+
+
+def log(m):
+    syslog.openlog("puyu-deploy", syslog.LOG_PID)
+    syslog.syslog(f"ip={IP} {m}")
+
+
+def morir(m):
+    log(f"RECHAZADO {m}")
+    print(f"ERROR: {m}", file=sys.stderr)
+    sys.exit(1)
+
+
+def docker(*args, timeout=TIMEOUT):
+    try:
+        return subprocess.run(["docker", *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        morir(f"docker {args[0]} excedio {timeout}s")
+
+
+def cargar(nombre, ent):
+    try:
+        d = yaml.safe_load(open(YAMLF)) or {}
+    except Exception as ex:
+        morir(f"no se pudo leer {YAMLF}: {ex}")
+
+    svc = next((s for s in d.get("servicios") or [] if s.get("nombre") == nombre), None)
+    if svc is None:
+        morir(f"servicio desconocido: {nombre}")
+    if "despliegue" not in svc:
+        morir(f"{nombre} no declara bloque 'despliegue'")
+    e = (svc.get("entornos") or {}).get(ent)
+    if not e:
+        morir(f"{nombre} no declara el entorno {ent}")
+    return svc, e
+
+
+def validar(svc, e):
+    dep = svc["despliegue"]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{1,63}", dep.get("imagen", "")):
+        morir(f"imagen invalida: {dep.get('imagen')!r}")
+    uid = dep.get("uid", 10001)
+    if not isinstance(uid, int) or not (1000 <= uid <= 65533):
+        morir(f"uid invalido: {uid!r}")
+
+    for campo in ("http", "mem", "cpus", "env"):
+        if campo not in e:
+            morir(f"falta '{campo}' en el entorno")
+
+    p = e["http"]
+    if not isinstance(p, int) or isinstance(p, bool) or not (1024 <= p <= 65535):
+        morir(f"puerto http invalido: {p!r}")
+
+    t = e.get("tcp", "-")
+    if str(t) != "-" and (not isinstance(t, int) or not (1024 <= t <= 65535)):
+        morir(f"puerto tcp invalido: {t!r}")
+
+    if not re.fullmatch(r"\d+[mg]", str(e["mem"])):
+        morir(f"memoria invalida: {e['mem']!r}")
+    if not re.fullmatch(r"\d+(\.\d+)?", str(e["cpus"])) or float(e["cpus"]) > 8:
+        morir(f"cpus invalido: {e['cpus']!r}")
+
+    ruta = e["env"]
+    if not re.fullmatch(r"/home/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/\.env", ruta):
+        morir(f"env invalido: {ruta!r}")
+    if os.path.islink(ruta):
+        morir("el env no puede ser un enlace simbolico")
+    if not os.path.isfile(ruta):
+        morir(f"no existe {ruta}")
+    st = os.stat(ruta)
+    if st.st_size == 0:
+        morir(f"{ruta} esta vacio")
+    if st.st_uid != 0:
+        morir(f"{ruta} no pertenece a root")
+    if st.st_mode & 0o077:
+        morir(f"{ruta} tiene permisos {oct(st.st_mode & 0o777)}, debe ser 600")
+
+
+def etiqueta_del_tar(ruta, esperada):
+    """Lee manifest.json SIN cargar la imagen en el demonio."""
+    try:
+        with tarfile.open(ruta, "r") as t:
+            m = t.extractfile("manifest.json")
+            if m is None:
+                morir("el tar no contiene manifest.json")
+            datos = json.loads(m.read())
+    except tarfile.TarError as ex:
+        morir(f"el archivo no es un tar valido: {ex}")
+    except KeyError:
+        morir("el tar no parece una imagen de Docker")
+
+    tags = []
+    for entrada in datos:
+        tags += entrada.get("RepoTags") or []
+    if not tags:
+        morir("la imagen del tar no trae etiqueta")
+    if len(tags) != 1:
+        morir(f"el tar trae {len(tags)} imagenes, se espera 1: {tags}")
+
+    base = tags[0].split(":")[0].split("/")[-1]
+    if base != esperada:
+        morir(f"la imagen del tar es '{tags[0]}', se esperaba '{esperada}'")
+    return tags[0]
+
+
+def recibir_tar(esperada):
+    tmpdir = "/var/lib/puyu"
+    libre = shutil.disk_usage(tmpdir).free
+    if libre < MAX_TAR + MARGEN:
+        morir(f"disco insuficiente: {libre // 1024**2} MB libres")
+
+    fd, ruta = tempfile.mkstemp(dir=tmpdir, prefix="img-", suffix=".tar")
+    os.fchmod(fd, 0o600)
+    n = 0
+    with os.fdopen(fd, "wb") as f:
+        while True:
+            b = sys.stdin.buffer.read(1 << 20)
+            if not b:
+                break
+            n += len(b)
+            if n > MAX_TAR:
+                os.remove(ruta)
+                morir(f"la imagen supera {MAX_TAR // 1024**2} MB")
+            f.write(b)
+
+    if n < MIN_TAR:
+        os.remove(ruta)
+        morir(f"la imagen pesa {n} bytes, demasiado poco")
+
+    tag = etiqueta_del_tar(ruta, esperada)
+    h = hashlib.sha256(open(ruta, "rb").read(1 << 24)).hexdigest()[:16]
+    print(f"imagen recibida: {n} bytes  tag={tag}  sha256:{h}")
+    return ruta, tag, h
+
+
+def correr(svc, e, cont, tag):
+    dep = svc["despliegue"]
+    puertos = ["-p", f"127.0.0.1:{e['http']}:{e['http']}"]
+    if str(e.get("tcp", "-")) != "-":
+        puertos += ["-p", f"0.0.0.0:{e['tcp']}:{e['tcp']}"]
+
+    return docker("run", "-d",
+                  "--name", cont,
+                  "--restart", "always",
+                  "--network", RED,
+                  "--env-file", e["env"],
+                  "--user", str(dep.get("uid", 10001)),
+                  *puertos,
+                  f"--memory={e['mem']}",
+                  f"--cpus={e['cpus']}",
+                  "--pids-limit", "512",
+                  "--security-opt", "no-new-privileges:true",
+                  "--cap-drop", "ALL",
+                  "--read-only",
+                  "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
+                  "--log-driver", "json-file",
+                  "--log-opt", "max-size=50m", "--log-opt", "max-file=3",
+                  tag)
+
+
+def main():
+    os.umask(0o077)
+
+    if len(sys.argv) != 4:
+        morir("uso: puyu-deploy <accion> <servicio> <dev|prod>")
+    accion, nombre, ent = sys.argv[1:4]
+    if accion not in ("desplegar", "estado", "registro", "revertir"):
+        morir(f"accion no permitida: {accion}")
+    if ent not in ("dev", "prod"):
+        morir("entorno debe ser dev o prod")
+
+    svc, e = cargar(nombre, ent)
+    cont = nombre if ent == "prod" else nombre + "-dev"
+    imagen = svc["despliegue"]["imagen"]
+
+    if accion == "estado":
+        r = docker("inspect", "-f",
+                   "{{.Name}} estado={{.State.Status}} reinicios={{.RestartCount}} "
+                   "imagen={{.Config.Image}} desde={{.State.StartedAt}}", cont)
+        if r.returncode:
+            morir(f"no existe el contenedor {cont}")
+        print(r.stdout.strip())
+        return
+
+    if accion == "registro":
+        r = docker("logs", "--tail", "50", cont)
+        print(r.stdout or r.stderr)
+        return
+
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        morir("hay otro despliegue en curso")
+
+    validar(svc, e)
+
+    if accion == "revertir":
+        if docker("image", "inspect", f"{imagen}:previo").returncode:
+            morir("no hay imagen previa guardada")
+        docker("stop", "-t", "20", cont)
+        docker("rm", cont)
+        r = correr(svc, e, cont, f"{imagen}:previo")
+        if r.returncode:
+            morir(f"no se pudo revertir: {r.stderr.strip()[:200]}")
+        log(f"revertido {cont}")
+        print(f"OK revertido {cont}")
+        return
+
+    ruta, tag, h = recibir_tar(imagen)
+
+    previo = docker("inspect", "-f", "{{.Image}}", cont).stdout.strip()
+    if previo:
+        docker("tag", previo, f"{imagen}:previo")
+
+    r = docker("load", "-i", ruta)
+    os.remove(ruta)
+    if r.returncode:
+        morir(f"docker load fallo: {r.stderr.strip()[:200]}")
+
+    docker("stop", "-t", "20", cont)
+    docker("rm", cont)
+
+    r = correr(svc, e, cont, tag)
+    if r.returncode:
+        morir(f"docker run fallo: {r.stderr.strip()[:300]}")
+
+    estable = False
+    for _ in range(15):
+        time.sleep(2)
+        est = docker("inspect", "-f", "{{.State.Status}}", cont).stdout.strip()
+        if est != "running":
+            break
+    else:
+        estable = True
+
+    if estable:
+        log(f"desplegado {cont} tag={tag} sha256={h}")
+        print(f"OK {cont} running  tag={tag}  sha256:{h}")
+        return
+
+    log(f"FALLO {cont} estado={est} sha256={h}")
+    print(f"FALLO: {cont} quedo en estado '{est}'", file=sys.stderr)
+    print(docker("logs", "--tail", "40", cont).stderr[-3000:], file=sys.stderr)
+    print(f"revertir con: revertir {nombre} {ent}", file=sys.stderr)
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,44 +1,81 @@
 # puyu-infra-runners
 
-**Privado.** Scripts que viven en los servidores de Puyu y se ejecutan como root.
+**PRIVADO.** Scripts que viven en los servidores de Puyu y corren como root.
 
-## puyu-alta
+## Flujo
 
-Recibe `servicios.yaml` por stdin (lo envia el job de `puyu-routes`) y reconcilia:
+    Jenkins --ssh--> servicio-init.sh   (root; jenkins NO puede modificarlo)
+                          |
+                          +-- 0. se actualiza a si mismo desde este repo
+                          +-- rutas   < servicios.yaml  ->  puyu-alta
+                          +-- imagen  < imagen.tar      ->  puyu-deploy
 
-- crea `/home/<servicio>/<entorno>/.env` vacio si no existe, en modo 600
-- corrige los permisos si estaban mal
-- crea o actualiza el servicio y la ruta en Kong con `PUT` (idempotente)
-- agrega los plugins declarados que falten
+Jenkins elige una opcion de un menu cerrado. No manda comandos ni parametros de
+ejecucion: puertos, limites y rutas salen de `servicios.yaml`, que pasa por PR
+en `Labotec-Peru/puyu-routes`.
 
-No borra, no despliega contenedores, no ejecuta comandos arbitrarios.
+## Menu
 
-### Por que esta separado de puyu-routes
+| Accion | Entrada | Efecto |
+|---|---|---|
+| `menu` | — | lista las opciones |
+| `rutas` | `servicios.yaml` por stdin | crea `.env` y reconcilia Kong |
+| `imagen <svc> <ent>` | `.tar` por stdin | carga y levanta el contenedor |
+| `estado <svc> <ent>` | — | solo lectura |
+| `registro <svc> <ent>` | — | ultimas 50 lineas |
+| `revertir <svc> <ent>` | — | vuelve a la imagen `:previo` |
 
-`puyu-routes` lo descarga Jenkins en cada build. Este repositorio no: el script
-se instala a mano y el usuario `jenkins` no puede modificarlo.
+## Por que los runners corren como root
 
-### Modelo de confianza
+Un usuario que puede ejecutar Docker **es** root en el host: el socket no tiene
+permisos intermedios, y quien lo alcanza monta `/` en un contenedor privilegiado.
+Fue el vector de marzo, cuando `jenkins` estaba en el grupo `docker`.
 
-El YAML llega desde Jenkins, asi que la unica defensa son las validaciones:
+No existe "un usuario que solo toque /home y Docker". La frontera no es el
+usuario sino el script inmutable: `jenkins` no tiene privilegios y lo unico que
+puede invocar es este menu.
+
+## Autoactualizacion
+
+Antes de cada accion se trae este repo y se reinstalan los binarios. **El commit
+debe estar firmado** por alguien de `/etc/puyu/allowed_signers`: sin eso, quien
+controle el repositorio controla root en el servidor.
+
+Firmar desde tu PC:
+
+    git config --global gpg.format ssh
+    git config --global user.signingkey ~/.ssh/firma-puyu.pub
+    git config --global commit.gpgsign true
+
+## Validaciones
 
 | Campo | Regla |
 |---|---|
 | `nombre` | `[a-z0-9][a-z0-9-]{1,48}` |
-| `env` | exactamente `/home/<x>/<y>/.env`, sin `..`, sin enlaces simbolicos |
-| `http` | entero entre 1024 y 65535 |
+| `env` | `/home/<x>/<y>/.env`, sin `..`, sin enlaces simbolicos, root, 600, no vacio |
+| `http` / `tcp` | entero 1024-65535 |
+| `mem` | `\d+[mg]` |
+| `cpus` | numerico, maximo 8 |
 | `kong_host` | obligatoriamente bajo `.puyu-iot.com` |
 | `plugins` | lista blanca de seis |
-| tamano | maximo 256 KB y 100 servicios |
+| imagen | **exactamente una** etiqueta en el tar, igual a la declarada |
 
-Se valida el YAML **completo** antes de aplicar nada: si una entrada esta mal,
-aborta sin haber tocado un solo archivo.
+El tar se inspecciona leyendo `manifest.json` **sin cargarlo en el demonio**. Eso
+impide colar una imagen extra o con otra etiqueta. No cubre que Jenkins produzca
+un binario malicioso bajo la etiqueta correcta: para eso hace falta firma.
 
-Si alguien toma Jenkins, lo peor que logra es crear archivos `.env` vacios y
-registrar rutas en Kong bajo el dominio propio. Todo queda en syslog con el
-`sha256` del YAML aplicado:
+## El contenedor
 
-    journalctl -t puyu-alta
+`--cap-drop ALL`, `--read-only`, `--user` del YAML, `--pids-limit 512`,
+`no-new-privileges`, limites de memoria y CPU, HTTP publicado solo en `127.0.0.1`.
+
+El `0.0.0.0` del puerto TCP es explicito a proposito: `daemon.json` tiene
+`"ip": "127.0.0.1"`, asi que un `-p 5010:5010` sin IP publicaria solo en loopback
+y los dispositivos no llegarian.
+
+## Registro
+
+    journalctl -t servicio-init -t puyu-alta -t puyu-deploy --since today
 
 ## Instalacion
 
