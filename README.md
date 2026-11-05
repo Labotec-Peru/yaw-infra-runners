@@ -80,7 +80,7 @@ config en el servidor — un solo lugar, sin editar binarios:
 | Archivo | Controla |
 |---|---|
 | `/etc/puyu/ips-permitidas.txt` | IPs/redes permitidas en el codigo. Si existe → modo ESTRICTO |
-| `/etc/puyu/ioc-exentos.txt` | Exenciones IOC por `ruta \| patron`. Si no existe → defaults internos |
+| `/etc/puyu/ioc-exentos.txt` | Exenciones IOC: `ruta \| patron [\| fragmento]`. Sin fragmento exime el patron completo en esa ruta; con fragmento (regex) solo la coincidencia exacta. `ruta/*` aplica a todo el prefijo. Si no existe → defaults internos |
 
 Ambos archivos de ejemplo viven en `etc/` de este repo.
 

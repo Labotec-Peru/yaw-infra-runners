@@ -20,7 +20,8 @@ etc/passwd | manipulacion de cron
 etc/passwd- | manipulacion de cron
 
 # ── webroot de los fronts ────────────────────────────────────────────────────
-# El bundle JS minificado trae cualquier puerto de 4-5 digitos: el patron de
-# puertos de pool es ruido puro ahi. El '*' aplica la exencion a todo el
-# prefijo (los nombres de los assets cambian en cada build).
-usr/share/nginx/html/* | puerto tipico de pool de minado
+# El bundle JS minificado trae constantes de UI (maxValue:9999, zIndex:9999).
+# El tercer campo (fragmento) exime SOLO la coincidencia exacta de ese
+# fragmento; cualquier otro puerto del patron sigue rechazando. Sin tercer
+# campo, se exime el patron completo en esa ruta.
+usr/share/nginx/html/* | puerto tipico de pool de minado | :9999\b

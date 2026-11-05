@@ -107,15 +107,18 @@ IOC = [
 # por linea: "ruta | patron"). Si el archivo NO existe se usan estos defaults;
 # si existe (aunque sea vacio) manda el archivo.
 IOC_EXENTOS_F = "/etc/puyu/ioc-exentos.txt"
+# Valores: {patron: [regex de fragmentos]}. Lista vacia = exencion TOTAL del
+# patron en esa ruta. Con fragmentos, solo la coincidencia que cae dentro del
+# fragmento se rebaja a aviso; el resto del patron sigue rechazando.
 IOC_EXENTOS_DEFAULT = {
     # registro de applets de busybox (alpine): contiene la palabra 'setsid'
-    "etc/busybox-paths.d/busybox": {"tecnica de persistencia u ocultamiento"},
+    "etc/busybox-paths.d/busybox": {"tecnica de persistencia u ocultamiento": []},
     # el usuario 'cron' del sistema tiene home /var/spool/cron
-    "etc/passwd":  {"manipulacion de cron"},
-    "etc/passwd-": {"manipulacion de cron"},
-    # el bundle minificado de un front trae cualquier puerto de 4-5 digitos:
-    # el patron de puertos de pool es ruido puro ahi.
-    "usr/share/nginx/html/*": {"puerto tipico de pool de minado"},
+    "etc/passwd":  {"manipulacion de cron": []},
+    "etc/passwd-": {"manipulacion de cron": []},
+    # el bundle minificado trae constantes de UI (maxValue:9999, zIndex:9999):
+    # se exime SOLO el :9999; cualquier otro puerto del patron sigue rechazando.
+    "usr/share/nginx/html/*": {"puerto tipico de pool de minado": [re.compile(r":9999\b")]},
 }
 
 
@@ -127,19 +130,31 @@ def ioc_exentos():
         linea = linea.split("#")[0].strip()
         if not linea or "|" not in linea:
             continue
-        ruta, patron = linea.split("|", 1)
-        d.setdefault(ruta.strip(), set()).add(patron.strip())
+        partes = [p.strip() for p in linea.split("|")]
+        ruta, patron = partes[0], partes[1]
+        frag = partes[2] if len(partes) > 2 and partes[2] else None
+        regs = d.setdefault(ruta, {}).setdefault(patron, [])
+        if frag is not None:
+            regs.append(re.compile(frag))
     return d
 
 
-def exento_ioc(ruta, que):
-    """True si el par (ruta, patron) esta exento. Las claves terminadas en '*'
-    aplican a todo el prefijo (ej. usr/share/nginx/html/*)."""
+def exento_ioc(ruta, que, datos, m):
+    """True si el hallazgo esta exento. Sin fragmentos: exencion total del
+    patron en la ruta. Con fragmentos: solo si el fragmento cae DENTRO del
+    span del hallazgo (m), para no aflojar otras coincidencias del archivo."""
     for clave, patrones in IOC_EXENTOS.items():
         if clave.endswith("*"):
-            if ruta.startswith(clave[:-1]) and que in patrones:
-                return True
-        elif ruta == clave and que in patrones:
+            if not ruta.startswith(clave[:-1]):
+                continue
+        elif ruta != clave:
+            continue
+        regs = patrones.get(que)
+        if regs is None:
+            continue
+        if not regs:
+            return True
+        if any(r.search(datos, m.start(), m.end()) for r in regs):
             return True
     return False
 
@@ -253,9 +268,10 @@ def revisar_entrada(ti, datos, capa, tipo):
     # 7. contenido
     if datos and not es_elf:
         for rx, que in IOC:
-            if rx.search(datos):
-                if exento_ioc(ruta, que):
-                    aviso(f"{que} en /{ruta} (patron exento)  [capa {capa}]")
+            m = rx.search(datos)
+            if m:
+                if exento_ioc(ruta, que, datos, m):
+                    aviso(f"{que} en /{ruta} (hallazgo exento)  [capa {capa}]")
                 else:
                     rechaza(f"{que} en /{ruta}  [capa {capa}]")
         raras = ip_sospechosa(datos)
