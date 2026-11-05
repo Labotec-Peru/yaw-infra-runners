@@ -403,13 +403,25 @@ def esperar(cfg, cont, intentos=None):
     return False
 
 
+def ip_home_net(cont):
+    """IP actual del contenedor en home-net (vacia si no esta conectado)."""
+    r = docker("inspect", "-f",
+               '{{(index .NetworkSettings.Networks "' + RED + '").IPAddress}}',
+               cont)
+    return (r.stdout or "").strip()
+
+
 def nombre_resuelve(cont):
-    """True si el nombre del contenedor resuelve en el DNS embebido de Docker
-    (127.0.0.11) visto desde el propio contenedor: la misma vista que tiene
-    el nginx del host para llegar a los fronts."""
+    """True si el nombre resuelve en el DNS embebido de Docker (127.0.0.11)
+    visto desde el propio contenedor y devuelve EXACTAMENTE la IP actual en
+    home-net. Una IP vieja (stale de libnetwork tras el renombrado atomico)
+    cuenta como fallo: nginx daria 502 'Connection refused'."""
+    esperada = ip_home_net(cont)
+    if not esperada:
+        return False
     r = docker("exec", cont, "getent", "hosts", cont, timeout=15)
-    return r.returncode == 0 and \
-        re.search(r"\d+\.\d+\.\d+\.\d+", r.stdout or "") is not None
+    ips = re.findall(r"\d+\.\d+\.\d+\.\d+", r.stdout or "")
+    return set(ips) == {esperada}
 
 
 def asegurar_dns(cfg, cont):
