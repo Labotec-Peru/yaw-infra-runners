@@ -434,7 +434,7 @@ def rollback(cfg, cont, viejo):
         return
     docker("rename", viejo, cont)
     docker("start", cont)
-    if esperar(cfg, cont, intentos=15):
+    if esperar(cfg, cont, intentos=45):
         log(f"ROLLBACK OK {cont}")
         print("!! rollback OK: la version anterior esta viva y responde",
               file=sys.stderr)
