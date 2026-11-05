@@ -118,7 +118,7 @@ IOC_EXENTOS_DEFAULT = {
     "etc/passwd-": {"manipulacion de cron": []},
     # el bundle minificado trae constantes de UI (maxValue:9999, zIndex:9999):
     # se exime SOLO el :9999; cualquier otro puerto del patron sigue rechazando.
-    "usr/share/nginx/html/*": {"puerto tipico de pool de minado": [re.compile(r":9999\b")]},
+    "usr/share/nginx/html/*": {"puerto tipico de pool de minado": [re.compile(rb":9999\b")]},
 }
 
 
@@ -135,7 +135,8 @@ def ioc_exentos():
         frag = partes[2] if len(partes) > 2 and partes[2] else None
         regs = d.setdefault(ruta, {}).setdefault(patron, [])
         if frag is not None:
-            regs.append(re.compile(frag))
+            # el contenido escaneado es bytes: compilar el fragmento en bytes
+            regs.append(re.compile(frag.encode()))
     return d
 
 
