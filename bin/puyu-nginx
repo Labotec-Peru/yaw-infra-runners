@@ -1,23 +1,19 @@
 #!/usr/bin/env python3
-"""
-Aplica la configuracion de nginx del repo gitops (nginx.conf + conf.d/*.conf
-+ renovar_certificados.sh) recibida por stdin como tar(.gz). Lo invoca
-servicio-init.sh con la accion 'nginx'.
+"""Aplica la configuracion de nginx del repo gitops recibida por stdin como
+tar(.gz). Lo invoca servicio-init.sh con la accion 'nginx'.
 
-Validaciones ANTES de tocar nada:
-  - solo se aceptan: nginx.conf, renovar_certificados.sh y conf.d/*.conf
-  - sin rutas absolutas, sin '..', sin enlaces, sin directorios
-  - cada archivo <= 64 KB y el tar <= 2 MB
-  - server_name valido: termina en .puyu-iot.com (o '_' en el default)
-  - sin server_name duplicado entre archivos
-  - el backend (set $backend http://X:80 / proxy_pass http://X:80) debe ser
-    un nombre de contenedor valido
-  - SINTAXIS real: 'nginx -t' en un contenedor desechable (misma imagen del
-    nginx del host) con los archivos nuevos y los certs de letsencrypt.
-
-Si todo pasa, se aplica de forma atomica: respaldo del estado anterior,
-copia a /opt/nginx, 'nginx -t' real y reload. Si el -t real falla, se
-restaura el respaldo y se recarga.
+Flujo:
+  1. Recibe y valida el tar (solo nginx.conf, renovar_certificados.sh y
+     conf.d/*.conf; sin rutas absolutas, '..' ni enlaces; tamanos acotados).
+  2. Valida server_name (bajo .puyu-iot.com, duplicados http/https como aviso)
+     y backends (nombre valido de contenedor).
+  3. Genera la lista DOMAINS del renovar_certificados.sh desde los conf.d.
+  4. Certificados idempotentes: emite los faltantes, renueva los vencidos y
+     no toca los sanos (certbot --keep-until-expiring).
+  5. Valida sintaxis real con 'nginx -t' en un contenedor desechable (misma
+     imagen del nginx del host, certs y certbot montados).
+  6. Aplica de forma atomica: respaldo del estado anterior, copia a
+     /opt/nginx, 'nginx -t' real y reload. Si el -t real falla, restaura.
 """
 import os, re, sys, syslog, tarfile, shutil, subprocess
 
@@ -32,36 +28,40 @@ STAGING      = "/var/lib/puyu/nginx-staging"
 BACKUP       = "/var/lib/puyu/nginx-backup"
 MAX_FILE     = 64 * 1024
 MAX_TAR      = 2 * 1024**2
+EMAIL_CERTBOT = "labotecperupuyu@gmail.com"
 IP           = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
 
 CONF_OK    = re.compile(r"^conf\.d/[A-Za-z0-9][A-Za-z0-9._-]*\.conf$")
 NAME_OK    = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}$")
-# una o varias etiquetas DNS separadas por puntos (admite nombres base sin
-# subdominio, ej. apisprod, ota-server)
 DOMINIO_OK = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
 
 
 def log(m):
+    """Registra en syslog con el tag puyu-nginx."""
     syslog.openlog("puyu-nginx", syslog.LOG_PID)
     syslog.syslog(f"ip={IP} {m}")
 
 
 def morir(m):
+    """Registra el error y termina con estado 1."""
     log(f"RECHAZADO {m}")
     print(f"ERROR: {m}", file=sys.stderr)
     sys.exit(1)
 
 
 def aviso(m):
+    """Aviso no bloqueante por stderr."""
     print(f"  aviso: {m}", file=sys.stderr)
 
 
 def docker(*a, timeout=120):
+    """Ejecuta docker con salida capturada."""
     return subprocess.run(["docker", *a], capture_output=True,
                           text=True, timeout=timeout)
 
 
 def revisar_conf(nombre, datos, dominios):
+    """Valida server_name y backends de un conf y acumula los dominios."""
     texto = datos.decode("utf-8", errors="replace")
     for m in re.finditer(r"server_name\s+([^;]+);", texto):
         for d in m.group(1).split():
@@ -71,7 +71,6 @@ def revisar_conf(nombre, datos, dominios):
                not DOMINIO_OK.match(d[:-len(".puyu-iot.com")]):
                 morir(f"{nombre}: server_name invalido: {d!r}")
             if d in dominios:
-                # legal en nginx: mismo server_name en bloques http y https
                 aviso(f"server_name repetido: {d} "
                       f"(en {dominios[d]} y {nombre})")
                 continue
@@ -84,6 +83,7 @@ def revisar_conf(nombre, datos, dominios):
 
 
 def recibir_tar():
+    """Extrae y valida el tar de stdin en STAGING; devuelve los dominios."""
     if os.path.exists(STAGING):
         shutil.rmtree(STAGING)
     os.makedirs(os.path.join(STAGING, "conf.d"))
@@ -136,6 +136,7 @@ def recibir_tar():
 
 
 def validar_sintaxis():
+    """Valida la config con 'nginx -t' en un contenedor desechable."""
     r = docker("run", "--rm",
                "-v", f"{STAGING}/nginx.conf:/etc/nginx/nginx.conf:ro",
                "-v", f"{STAGING}/conf.d:/etc/nginx/conf.d:ro",
@@ -160,9 +161,7 @@ def validar_sintaxis():
 
 
 def generar_renovar(dominios):
-    """El renovar_certificados.sh del repo es un TEMPLATE con el marcador
-    '# @@DOMAINS@@': aqui se rellena con los server_name de los conf.d
-    aplicados, asi la lista nunca se edita a mano."""
+    """Rellena el marcador '# @@DOMAINS@@' del renovar_certificados.sh."""
     ruta = os.path.join(STAGING, "renovar_certificados.sh")
     if not os.path.isfile(ruta):
         return
@@ -176,13 +175,9 @@ def generar_renovar(dominios):
         f.write(texto)
 
 
-EMAIL_CERTBOT = "labotecperupuyu@gmail.com"
-
-
 def renovar_certs(dominios):
-    """Idempotente: emite los certificados que no existen y renueva los
-    vencidos. --keep-until-expiring hace que certbot no toque los que estan
-    al dia (no consume peticiones de Let's Encrypt)."""
+    """Certificados idempotentes: emite faltantes, renueva vencidos,
+    no toca los sanos."""
     if not dominios:
         return
     emitidos = []
@@ -209,6 +204,7 @@ def renovar_certs(dominios):
 
 
 def respaldar():
+    """Guarda una copia del estado actual de /opt/nginx en BACKUP."""
     if os.path.exists(BACKUP):
         shutil.rmtree(BACKUP)
     os.makedirs(os.path.join(BACKUP, "conf.d"))
@@ -223,6 +219,7 @@ def respaldar():
 
 
 def restaurar():
+    """Restaura el respaldo y recarga nginx."""
     for f in os.listdir(NGINX_CONF_D):
         p = os.path.join(NGINX_CONF_D, f)
         if os.path.isfile(p):
@@ -238,6 +235,8 @@ def restaurar():
 
 
 def aplicar():
+    """Copia STAGING a /opt/nginx, valida el -t real y recarga; con
+    restauracion automatica si el -t real falla."""
     respaldar()
 
     for f in os.listdir(NGINX_CONF_D):
@@ -261,6 +260,7 @@ def aplicar():
 
 
 def main():
+    """Punto de entrada: recibir, validar, certificados, aplicar y recargar."""
     os.umask(0o077)
     dominios = recibir_tar()
     generar_renovar(dominios)

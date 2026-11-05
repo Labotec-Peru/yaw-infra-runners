@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
-"""
-Reconcilia servicios.yaml (recibido por stdin) contra el servidor.
-Crea lo que falta, corrige lo que difiere, NO borra nada.
+"""Reconcilia servicios.yaml (recibido por stdin) contra el servidor: crea lo
+que falta, corrige lo que difiere y NO borra nada. Crea los .env declarados
+y registra servicios, rutas y plugins en Kong.
 
-En el servidor:
-  /usr/local/bin/puyu-alta        root:root 755
-  authorized_keys de jenkins:
-    command="sudo -n /usr/local/bin/puyu-alta",restrict ssh-ed25519 AAAA...
-
-Desde Jenkins:
-  ssh -i key jenkins@servidor < servicios.yaml
+Lo invoca servicio-init.sh con la accion 'rutas'. El YAML se valida completo
+ANTES de aplicar nada: nombres, rutas .env, puertos, hosts bajo .puyu-iot.com
+y plugins en lista blanca.
 """
 import os, re, sys, json, hashlib, syslog, urllib.request, urllib.error, yaml
 
@@ -26,17 +22,20 @@ creados, actualizados, sin_cambios, errores = [], [], [], []
 
 
 def log(m):
+    """Registra en syslog con el tag puyu-alta."""
     syslog.openlog("puyu-alta", syslog.LOG_PID)
     syslog.syslog(f"ip={IP} {m}")
 
 
 def morir(m):
+    """Registra el error y termina con estado 1."""
     log(f"ABORTADO {m}")
     print(f"ERROR: {m}", file=sys.stderr)
     sys.exit(1)
 
 
 def api(metodo, ruta, cuerpo=None):
+    """Llama a la Admin API de Kong y devuelve (status, json)."""
     datos = json.dumps(cuerpo).encode() if cuerpo is not None else None
     req = urllib.request.Request(ADMIN + ruta, data=datos, method=metodo,
                                  headers={"Content-Type": "application/json"})
@@ -49,9 +48,9 @@ def api(metodo, ruta, cuerpo=None):
         morir(f"Kong no responde en {ADMIN}: {ex.reason}")
 
 
-# --------------------------- validacion ------------------------------------
-
 def validar(svc):
+    """Valida un servicio del YAML: nombre, kong_path, plugins, entornos,
+    rutas .env, puertos y hosts."""
     if not isinstance(svc, dict):
         morir("entrada de servicio malformada")
 
@@ -95,9 +94,9 @@ def validar(svc):
                 morir(f"[{n}/{ent}] host malformado: {h!r}")
 
 
-# ------------------------- reconciliacion ----------------------------------
-
 def paths(nombre, ent, e):
+    """Crea la carpeta y el .env (vacio, 600) si no existen; corrige
+    permisos. No toca enlaces simbolicos."""
     ruta = e["env"]
     carpeta = os.path.dirname(ruta)
 
@@ -122,6 +121,7 @@ def paths(nombre, ent, e):
 
 
 def kong(svc, ent, e):
+    """Registra o actualiza el servicio, la ruta y los plugins en Kong."""
     kp = svc.get("kong_path") or ""
     if not kp:
         return
@@ -175,9 +175,8 @@ def kong(svc, ent, e):
             errores.append(f"{ruta_k}: plugin {p} fallo (HTTP {st})")
 
 
-# ------------------------------ entrada ------------------------------------
-
 def main():
+    """Punto de entrada: leer el YAML de stdin, validar TODO y reconciliar."""
     os.umask(0o077)
 
     crudo = sys.stdin.buffer.read(MAX_YAML + 1)

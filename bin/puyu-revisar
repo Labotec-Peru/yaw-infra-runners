@@ -1,35 +1,27 @@
 #!/usr/bin/env python3
-"""
-Revisa el contenido de una imagen Docker ANTES de cargarla en el demonio.
+"""Revisa el contenido de una imagen Docker ANTES de cargarla en el demonio.
 
   puyu-revisar <back|front> <ruta-del-tar>     -> 0 limpio, 1 rechazado
 
-Lee las capas con tarfile sin ejecutar nada y sin hacer 'docker load'. Lo que
-busca es lo que de verdad aparecio en los dos incidentes de este servidor:
-binarios plantados donde solo deberia haber un jar o HTML, bits setuid,
-nombres de mineros conocidos, y URLs de pools o descargas encadenadas a un
-shell.
+Lee las capas con tarfile sin ejecutar nada y sin hacer 'docker load'. Busca
+lo que de verdad aparecio en los incidentes de este servidor: binarios
+plantados donde solo deberia haber un jar o HTML, bits setuid, nombres de
+mineros conocidos, URLs de pools o descargas encadenadas a un shell, e IPs
+publicas embebidas (incluidas las de dentro del jar).
 
-Lo que SI atrapa
-  - un ELF en /app, /tmp, /dev/shm o en el webroot
-  - cualquier setuid/setgid que no sea de los del sistema base
-  - nombres de mineros y proxyware conocidos (xmrig, perfctl, kdevtmpfsi...)
-  - stratum+tcp://, puertos de pool, 'curl ... | sh'
-  - scripts ejecutables metidos en el webroot de un front
-  - IPs publicas embebidas, incluidas las de dentro del jar
+No atrapa (y conviene tenerlo claro): codigo malicioso ofuscado dentro de
+clases Java, dependencias envenenadas que se vean normales, ni nada que el
+atacante escriba en tiempo de ejecucion.
 
-Lo que NO atrapa, y conviene tenerlo claro
-  - codigo malicioso ofuscado dentro de clases Java
-  - una dependencia envenenada que se vea normal
-  - cualquier cosa que el atacante escriba en tiempo de ejecucion
+Los falsos positivos se ajustan SIN tocar el codigo en
+/etc/puyu/ioc-exentos.txt (ruta | patron [| fragmento]).
 """
 import io, os, re, sys, json, stat, tarfile, tempfile, zipfile, syslog, ipaddress
 
-MAX_TEXTO    = 4 * 1024**2        # no se escanea el contenido de nada mas grande
-MAX_TOTAL    = 3 * 1024**3        # tope de bytes leidos en total
+MAX_TEXTO    = 4 * 1024**2
+MAX_TOTAL    = 3 * 1024**3
 PERMITIDAS   = "/etc/puyu/ips-permitidas.txt"
 
-# Rutas donde un ejecutable nativo es normal (vienen de la imagen base).
 DIRS_ELF_OK = (
     "bin/", "sbin/", "lib/", "lib64/", "libexec/",
     "usr/bin/", "usr/sbin/", "usr/lib/", "usr/lib64/", "usr/libexec/",
@@ -37,12 +29,10 @@ DIRS_ELF_OK = (
     "usr/glibc-compat/", "opt/java/", "opt/jdk/", "opt/openjdk/",
     "etc/alternatives/", "etc/ssl/",
 )
-# Rutas donde un ejecutable nativo NO tiene nada que hacer.
 DIRS_PROHIBIDOS = (
     "app/", "tmp/", "var/tmp/", "dev/shm/", "run/shm/", "home/", "root/",
     "usr/share/nginx/html/", "var/www/", "srv/",
 )
-# Los pocos setuid legitimos de debian/alpine.
 SETUID_OK = {
     "bin/su", "bin/mount", "bin/umount", "bin/ping", "bin/ping6", "bin/busybox",
     "usr/bin/su", "usr/bin/sudo", "usr/bin/passwd", "usr/bin/chfn",
@@ -54,17 +44,12 @@ SETUID_OK = {
     "usr/lib/polkit-1/polkit-agent-helper-1", "usr/lib/eject/dmcrypt-get-device",
     "usr/lib/utempter/utempter",
 }
-# Rutas que las escribio el build, no la imagen base. Solo aqui una IP publica
-# bloquea el despliegue en modo estricto: una imagen base de 250 MB trae IPs
-# de ejemplo en documentacion, datos de zona horaria y fixtures de tests, y
-# rechazar por esas haria el modo estricto inservible.
 DIRS_DEL_BUILD = (
     "app/", "usr/share/nginx/html/", "var/www/", "usr/share/caddy/",
     "opt/app/", "srv/", "home/", "docker-entrypoint.d/",
     "etc/nginx/conf.d/", "etc/nginx/nginx.conf",
 )
 
-# Extensiones que puede tener un frontend compilado.
 WEB_OK = {
     ".html", ".htm", ".js", ".mjs", ".cjs", ".css", ".map", ".json", ".txt",
     ".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico", ".bmp",
@@ -101,28 +86,25 @@ IOC = [
      "manipulacion de cron"),
 ]
 
-# Falsos positivos conocidos de las imagenes base: solo ESE patron en ESE
-# archivo se rebaja a 'aviso'; cualquier otro hallazgo ahi sigue rechazando.
-# Se ajustan SIN tocar el codigo desde /etc/puyu/ioc-exentos.txt (una entrada
-# por linea: "ruta | patron"). Si el archivo NO existe se usan estos defaults;
-# si existe (aunque sea vacio) manda el archivo.
 IOC_EXENTOS_F = "/etc/puyu/ioc-exentos.txt"
-# Valores: {patron: [regex de fragmentos]}. Lista vacia = exencion TOTAL del
-# patron en esa ruta. Con fragmentos, solo la coincidencia que cae dentro del
-# fragmento se rebaja a aviso; el resto del patron sigue rechazando.
 IOC_EXENTOS_DEFAULT = {
-    # registro de applets de busybox (alpine): contiene la palabra 'setsid'
     "etc/busybox-paths.d/busybox": {"tecnica de persistencia u ocultamiento": []},
-    # el usuario 'cron' del sistema tiene home /var/spool/cron
     "etc/passwd":  {"manipulacion de cron": []},
     "etc/passwd-": {"manipulacion de cron": []},
-    # el bundle minificado trae constantes de UI (maxValue:9999, zIndex:9999):
-    # se exime SOLO el :9999; cualquier otro puerto del patron sigue rechazando.
     "usr/share/nginx/html/*": {"puerto tipico de pool de minado": [re.compile(rb":9999\b")]},
 }
 
+RE_IP = re.compile(rb"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
+
+leidos = 0
+IPS_VISTAS = set()
+hallazgos = []
+
 
 def ioc_exentos():
+    """Carga las exenciones IOC del archivo; si no existe, usa defaults.
+    Formato por linea: ruta | patron [| fragmento]. Lista vacia de fragmentos
+    exime el patron completo; con fragmentos solo esa coincidencia."""
     if not os.path.isfile(IOC_EXENTOS_F):
         return IOC_EXENTOS_DEFAULT
     d = {}
@@ -135,15 +117,13 @@ def ioc_exentos():
         frag = partes[2] if len(partes) > 2 and partes[2] else None
         regs = d.setdefault(ruta, {}).setdefault(patron, [])
         if frag is not None:
-            # el contenido escaneado es bytes: compilar el fragmento en bytes
             regs.append(re.compile(frag.encode()))
     return d
 
 
 def exento_ioc(ruta, que, datos, m):
-    """True si el hallazgo esta exento. Sin fragmentos: exencion total del
-    patron en la ruta. Con fragmentos: solo si el fragmento cae DENTRO del
-    span del hallazgo (m), para no aflojar otras coincidencias del archivo."""
+    """True si el hallazgo esta exento. Los fragmentos se evaluan DENTRO del
+    span del hallazgo para no aflojar otras coincidencias del archivo."""
     for clave, patrones in IOC_EXENTOS.items():
         if clave.endswith("*"):
             if not ruta.startswith(clave[:-1]):
@@ -162,22 +142,19 @@ def exento_ioc(ruta, que, datos, m):
 
 IOC_EXENTOS = ioc_exentos()
 
-RE_IP = re.compile(rb"\b(\d{1,3}(?:\.\d{1,3}){3})\b")
-
-leidos = 0
-IPS_VISTAS = set()
-hallazgos = []     # (gravedad, mensaje)  gravedad: 'rechaza' | 'aviso'
-
 
 def rechaza(m):
+    """Agrega un hallazgo bloqueante."""
     hallazgos.append(("rechaza", m))
 
 
 def aviso(m):
+    """Agrega un hallazgo informativo."""
     hallazgos.append(("aviso", m))
 
 
 def permitidas():
+    """Carga las IPs/redes permitidas; si existe el archivo, modo estricto."""
     redes = [ipaddress.ip_network(x) for x in
              ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
               "169.254.0.0/16", "100.64.0.0/10", "0.0.0.0/8", "224.0.0.0/4",
@@ -199,6 +176,7 @@ REDES_OK, ESTRICTO = permitidas()
 
 
 def ip_sospechosa(txt):
+    """Devuelve las IPs publicas que aparecen en txt."""
     raras = set()
     for m in RE_IP.finditer(txt):
         s = m.group(1).decode()
@@ -212,24 +190,21 @@ def ip_sospechosa(txt):
     return raras
 
 
-# ───────────────────────── escaneo de una entrada ──────────────────────────
-
 def revisar_entrada(ti, datos, capa, tipo):
-    """datos puede ser None si la entrada es grande o no es regular."""
+    """Revisa una entrada de capa: nombres conocidos, setuid, ELF fuera de
+    sitio, webroot, /app de los back, cron, contenido IOC e IPs."""
     ruta = ti.name.lstrip("./")
     base = os.path.basename(ruta)
 
-    if ".wh." in base:                       # whiteout de overlayfs
+    if ".wh." in base:
         return
     if not (ti.isfile() or ti.islnk() or ti.issym()):
         return
 
-    # 1. nombres conocidos
     if NOMBRES_MALOS.match(base):
         rechaza(f"nombre de minero/proxyware conocido: /{ruta}  [capa {capa}]")
         return
 
-    # 2. setuid / setgid
     if ti.mode & (stat.S_ISUID | stat.S_ISGID) and ruta not in SETUID_OK:
         rechaza(f"binario setuid/setgid no esperado: /{ruta} "
                 f"modo {oct(ti.mode)}  [capa {capa}]")
@@ -237,13 +212,11 @@ def revisar_entrada(ti, datos, capa, tipo):
     es_elf = bool(datos) and datos[:4] == b"\x7fELF"
     ext = os.path.splitext(base)[1].lower()
 
-    # 3. ejecutables nativos donde no deben estar
     if es_elf and ruta.startswith(DIRS_PROHIBIDOS):
         rechaza(f"ejecutable nativo (ELF) fuera de sitio: /{ruta}  [capa {capa}]")
     elif es_elf and not ruta.startswith(DIRS_ELF_OK):
         aviso(f"ejecutable nativo en ruta inusual: /{ruta}  [capa {capa}]")
 
-    # 4. el webroot de un front: solo estatico
     en_web = ruta.startswith(("usr/share/nginx/html/", "var/www/", "app/dist/",
                               "usr/share/caddy/", "app/build/"))
     if en_web:
@@ -256,17 +229,14 @@ def revisar_entrada(ti, datos, capa, tipo):
         if ti.mode & 0o111 and ext not in ("", ".sh"):
             aviso(f"archivo estatico con bit de ejecucion: /{ruta}  [capa {capa}]")
 
-    # 5. en /app de un back: solo el jar y config
     if tipo == "back" and ruta.startswith("app/"):
         if ext in EJECUTABLES or es_elf:
             rechaza(f"ejecutable en /app (solo deberia haber el jar): /{ruta} "
                     f" [capa {capa}]")
 
-    # 6. cron
     if ruta.startswith(("etc/cron", "var/spool/cron", "etc/periodic/")):
         aviso(f"entrada de cron en la imagen: /{ruta}  [capa {capa}]")
 
-    # 7. contenido
     if datos and not es_elf:
         for rx, que in IOC:
             m = rx.search(datos)
@@ -285,12 +255,13 @@ def revisar_entrada(ti, datos, capa, tipo):
             else:
                 aviso(f"IP publica embebida en /{ruta}: {lista}  [capa {capa}]")
 
-    # 8. dentro del jar
     if ext == ".jar" and datos:
         revisar_jar(ruta, datos, capa)
 
 
 def revisar_jar(ruta, datos, capa):
+    """Revisa el interior de un jar: ejecutables, patrones IOC e IPs en
+    configuraciones y textos."""
     try:
         z = zipfile.ZipFile(io.BytesIO(datos))
     except (zipfile.BadZipFile, MemoryError):
@@ -329,9 +300,8 @@ def revisar_jar(ruta, datos, capa):
                     aviso(f"IP publica dentro del jar /{ruta}!{n}: {lista}")
 
 
-# ───────────────────────────── recorrido ───────────────────────────────────
-
 def capas_del_tar(tar):
+    """Devuelve la lista de capas declaradas en manifest.json."""
     try:
         m = tar.extractfile("manifest.json")
         datos = json.loads(m.read())
@@ -348,6 +318,7 @@ def capas_del_tar(tar):
 
 
 def main():
+    """Recorre las capas, acumula hallazgos e imprime el veredicto."""
     global leidos
     solo_ips = "--ips" in sys.argv
     argv = [a for a in sys.argv if a != "--ips"]
@@ -390,8 +361,6 @@ def main():
                                   "la revision quedo incompleta")
                             break
                         datos = None
-                        # Los fat jar de Spring Boot pasan de 100 MB: sin leerlos
-                        # completos no se puede revisar su interior.
                         limite = MAX_TEXTO
                         base = os.path.basename(ti.name.lstrip("./"))
                         if os.path.splitext(base)[1].lower() == ".jar":
@@ -404,7 +373,7 @@ def main():
                         elif ti.isfile() and ti.size > limite:
                             ex = capa.extractfile(ti)
                             if ex:
-                                datos = ex.read(4)   # solo la firma ELF
+                                datos = ex.read(4)
                                 leidos += ti.size
                         revisar_entrada(ti, datos, n, tipo)
             except tarfile.TarError as ex:

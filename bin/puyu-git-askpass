@@ -1,5 +1,5 @@
 #!/bin/sh
-# Lo invoca git via GIT_ASKPASS: primero pregunta el usuario y despues el
+# Lo invoca git via GIT_ASKPASS: primero responde el usuario y despues el
 # token. El token nunca aparece en la linea de comandos (ps, logs, history).
 case "${1:-}" in
   *[Uu]sername*) echo "x-access-token" ;;

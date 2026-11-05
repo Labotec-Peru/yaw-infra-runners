@@ -9,6 +9,11 @@
 # /etc/sudoers.d/jenkins-alta DEBE preservar SSH_ORIGINAL_COMMAND:
 #   Defaults:jenkins env_keep += "SSH_CLIENT SSH_CONNECTION SSH_ORIGINAL_COMMAND"
 #   jenkins ALL=(root) NOPASSWD: /usr/local/bin/servicio-init.sh
+#
+# Acciones validas: menu | rutas | nginx | imagen <servicio> <dev|prod>
+# [clave=valor ...] | estado | registro | revertir. Aqui solo se valida la
+# FORMA del comando; los pares clave=valor los valida puyu-deploy contra su
+# lista blanca.
 
 set -uo pipefail
 
@@ -21,12 +26,12 @@ IP="${SSH_CLIENT%% *}"
 log(){ logger -t servicio-init "ip=$IP $*"; }
 morir(){ log "RECHAZADO $*"; echo "ERROR: $*" >&2; exit 1; }
 
+# Auto-actualiza este repo desde origin/main (token de la GitHub App via
+# puyu-git-askpass: nunca viaja en la linea de comandos) y reinstala los
+# binarios con verificacion de sintaxis.
 actualizar_bins() {
   install -d -m 700 /var/lib/puyu
 
-  # Acceso de SOLO LECTURA al repo: token de instalacion de la GitHub App
-  # (Labotec-Peru deshabilito las deploy keys). puyu-git-askpass le responde
-  # a git por nosotros: el token no aparece en la linea de comandos.
   export GIT_ASKPASS="$BIN/puyu-git-askpass"
   export GIT_TERMINAL_PROMPT=0
 
@@ -60,20 +65,6 @@ actualizar_bins() {
   echo "runners en commit $commit"
 }
 
-# ── parseo del comando ───────────────────────────────────────────────────────
-# Formas validas:
-#   menu
-#   rutas                                            (servicios.yaml por stdin)
-#   nginx                                            (configs de nginx por stdin, tar)
-#   imagen   <servicio> <dev|prod> [clave=valor ...] (tar por stdin)
-#   estado   <servicio> <dev|prod> [clave=valor ...]
-#   registro <servicio> <dev|prod> [clave=valor ...]
-#   revertir <servicio> <dev|prod> [clave=valor ...]
-#
-# Los pares clave=valor los manda el Jenkinsfile y los valida puyu-deploy
-# contra su propia lista blanca. Aqui solo se comprueba la FORMA: ni espacios
-# ni comillas ni metacaracteres pueden entrar.
-
 CMD="${SSH_ORIGINAL_COMMAND:-}"
 [ -n "$CMD" ] || morir "comando vacio. Si viene por sudo, revisa que \
 /etc/sudoers.d/jenkins-alta tenga SSH_ORIGINAL_COMMAND en env_keep"
@@ -81,7 +72,6 @@ CMD="${SSH_ORIGINAL_COMMAND:-}"
 [[ "$CMD" =~ ^[a-z]+( [a-z0-9][a-z0-9-]{1,48} (dev|prod)( [a-z_]{2,16}=[-A-Za-z0-9=:._/,%+]{1,256})*)?$ ]] \
   || morir "sintaxis: menu | rutas | imagen <servicio> <dev|prod> [clave=valor ...]"
 
-# read -r -a separa por espacios sin evaluar nada: no hay expansion de shell.
 read -r -a PARTES <<< "$CMD"
 ACCION="${PARTES[0]}"
 SERVICIO="${PARTES[1]:-}"
@@ -146,10 +136,10 @@ case "$ACCION" in
     echo "toda imagen pasa por puyu-revisar antes del docker load."
     ;;
 
+  # Accion desconocida: puede ser una accion NUEVA del repo. Auto-actualiza y
+  # reintenta UNA vez con el binario recien instalado; si sigue sin existir,
+  # rechaza.
   *)
-    # Accion desconocida: puede ser una accion NUEVA agregada al repo. Se
-    # auto-actualiza y reintenta UNA vez (exec con el binario recien
-    # instalado); si sigue sin existir, rechaza.
     if [ "${PUYU_REINTENTO:-0}" = "0" ]; then
       actualizar_bins
       PUYU_REINTENTO=1 exec "$BIN/servicio-init.sh"

@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""
-Genera el token de instalacion de la GitHub App de Puyu (acceso de SOLO
+"""Genera el token de instalacion de la GitHub App de Puyu (acceso de SOLO
 LECTURA al repo privado de runners). Labotec-Peru deshabilito las deploy
 keys: este es el reemplazo.
 
-  puyu-token        -> imprime un token valido por stdout
+  puyu-token   -> imprime un token valido por stdout
 
-Flujo: firma un JWT (RS256) con la clave privada de la app, pide un token de
+Firma un JWT (RS256) con la clave privada de la app, pide un token de
 instalacion a la API de GitHub y lo cachea en /var/lib/puyu/token (root 600)
-hasta 5 minutos antes de expirar. Git lo pide varias veces por accion (una
-por prompt) y no conviene pegarle a la API en cada uno.
-
-El token NUNCA viaja en la linea de comandos: lo entrega puyu-git-askpass
-directo a git. En ps/logs solo se ve la URL sin credenciales.
+hasta 5 minutos antes de expirar. El token NUNCA viaja en la linea de
+comandos: lo entrega puyu-git-askpass directo a git.
 
 Config en /etc/puyu/github-app.conf (root 600):
   APP_ID=123456
@@ -24,26 +20,30 @@ import subprocess, urllib.request, urllib.error
 
 CONF    = "/etc/puyu/github-app.conf"
 TOKEN_F = "/var/lib/puyu/token"
-MARGEN  = 300          # renovar 5 minutos antes de expirar
+MARGEN  = 300
 IP      = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
 
 
 def log(m):
+    """Registra en syslog con el tag puyu-token."""
     syslog.openlog("puyu-token", syslog.LOG_PID)
     syslog.syslog(f"ip={IP} {m}")
 
 
 def morir(m):
+    """Registra el error y termina con estado 1."""
     log(f"RECHAZADO {m}")
     print(f"ERROR: {m}", file=sys.stderr)
     sys.exit(1)
 
 
 def b64u(b):
+    """Base64url sin padding."""
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
 def conf():
+    """Lee y valida /etc/puyu/github-app.conf (root 600)."""
     if not os.path.isfile(CONF):
         morir(f"falta {CONF} (APP_ID, INSTALL_ID, PEM)")
     st = os.stat(CONF)
@@ -69,6 +69,7 @@ def conf():
 
 
 def cacheado(ahora):
+    """Devuelve el token cacheado si aun no esta por vencer."""
     try:
         with open(TOKEN_F) as f:
             datos = json.load(f)
@@ -82,6 +83,7 @@ def cacheado(ahora):
 
 
 def pedir_token(app_id, install_id, pem):
+    """Firma el JWT, pide el token a la API y lo cachea (root 600)."""
     ahora = int(time.time())
     cab = b64u(json.dumps({"alg": "RS256", "typ": "JWT"}).encode())
     cue = b64u(json.dumps({"iat": ahora - 60, "exp": ahora + 540,
@@ -118,6 +120,7 @@ def pedir_token(app_id, install_id, pem):
 
 
 def main():
+    """Imprime el token (cacheado o nuevo) por stdout."""
     app_id, install_id, pem = conf()
     t = cacheado(time.time())
     if t:
