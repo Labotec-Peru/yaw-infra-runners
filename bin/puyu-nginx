@@ -176,6 +176,38 @@ def generar_renovar(dominios):
         f.write(texto)
 
 
+EMAIL_CERTBOT = "labotecperupuyu@gmail.com"
+
+
+def renovar_certs(dominios):
+    """Idempotente: emite los certificados que no existen y renueva los
+    vencidos. --keep-until-expiring hace que certbot no toque los que estan
+    al dia (no consume peticiones de Let's Encrypt)."""
+    if not dominios:
+        return
+    emitidos = []
+    for d in sorted(dominios):
+        print(f"  certificado: {d} ...")
+        r = docker("run", "--rm",
+                   "-v", f"{CERTS_HOST}:/etc/letsencrypt",
+                   "-v", f"{CERTBOT_HOST}:/var/www/certbot",
+                   "certbot/certbot:latest", "certonly", "--webroot",
+                   "-w", "/var/www/certbot",
+                   "--non-interactive", "--agree-tos", "--no-eff-email",
+                   "--keep-until-expiring", "--key-type", "ecdsa",
+                   "--email", EMAIL_CERTBOT, "-d", d,
+                   timeout=300)
+        if r.returncode != 0:
+            morir(f"certbot fallo para {d}:\n" + (r.stderr or r.stdout)[:800])
+        salida = r.stdout or r.stderr or ""
+        if "Successfully received certificate" in salida:
+            emitidos.append(d)
+        print(f"    OK {d}")
+    if emitidos:
+        print(f"  certificados: {len(emitidos)} emitido(s)/renovado(s), "
+              f"{len(dominios) - len(emitidos)} al dia")
+
+
 def respaldar():
     if os.path.exists(BACKUP):
         shutil.rmtree(BACKUP)
@@ -232,6 +264,7 @@ def main():
     os.umask(0o077)
     dominios = recibir_tar()
     generar_renovar(dominios)
+    renovar_certs(dominios)
     validar_sintaxis()
     aplicar()
     print(f"OK nginx: {len(dominios)} dominio(s) revisados; "
