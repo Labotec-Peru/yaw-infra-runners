@@ -20,6 +20,7 @@ en `Labotec-Peru/puyu-routes`.
 |---|---|---|
 | `menu` | — | lista las opciones |
 | `rutas` | `servicios.yaml` por stdin | crea `.env` y reconcilia Kong |
+| `nginx` | tar (nginx.conf + conf.d) por stdin | valida y aplica la config de nginx con reload atomico |
 | `imagen <svc> <ent>` | `.tar` por stdin | carga y levanta el contenedor |
 | `estado <svc> <ent>` | — | solo lectura |
 | `registro <svc> <ent>` | — | ultimas 50 lineas |
@@ -35,6 +36,12 @@ eliminarlo.
 La membresia de `servicios.yaml` aplica SOLO a los `back` (tienen ruta Kong
 y `.env`). Los `front` no pasan por el registro: se declaran en el nginx del
 host, que los alcanza por nombre en `home-net`.
+
+`nginx` recibe un tar con `nginx.conf` + `conf.d/*.conf` y valida antes de
+tocar nada: rutas/extensiones permitidas, tamaños, `server_name` bajo
+`.puyu-iot.com` sin duplicados, backends con nombre válido de contenedor, y
+sintaxis real (`nginx -t` en un contenedor desechable con los certs). Aplica
+con respaldo y reload atómico; si el `-t` real falla, restaura el respaldo.
 
 > El sudoers de jenkins debe preservar `SSH_ORIGINAL_COMMAND` (`env_keep`),
 > ademas de `SSH_CLIENT` y `SSH_CONNECTION`: sin ella, `sudo` la borra y el

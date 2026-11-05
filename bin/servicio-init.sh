@@ -43,7 +43,7 @@ actualizar_bins() {
 
   local commit; commit=$(git -C "$REPO_DIR" rev-parse --short HEAD)
 
-  for f in puyu-alta puyu-deploy puyu-revisar puyu-token; do
+  for f in puyu-alta puyu-deploy puyu-revisar puyu-token puyu-nginx; do
     [ -f "$REPO_DIR/bin/$f" ] || morir "falta bin/$f en el repo"
     python3 -m py_compile "$REPO_DIR/bin/$f" || morir "bin/$f no compila"
     install -m 755 -o root -g root "$REPO_DIR/bin/$f" "$BIN/$f"
@@ -64,6 +64,7 @@ actualizar_bins() {
 # Formas validas:
 #   menu
 #   rutas                                            (servicios.yaml por stdin)
+#   nginx                                            (configs de nginx por stdin, tar)
 #   imagen   <servicio> <dev|prod> [clave=valor ...] (tar por stdin)
 #   estado   <servicio> <dev|prod> [clave=valor ...]
 #   registro <servicio> <dev|prod> [clave=valor ...]
@@ -103,6 +104,11 @@ case "$ACCION" in
     chmod 600 "$CACHE"
     ;;
 
+  nginx)
+    actualizar_bins
+    "$BIN/puyu-nginx"
+    ;;
+
   imagen)
     [ -n "${SERVICIO:-}" ] && [ -n "${ENTORNO:-}" ] \
       || morir "uso: imagen <servicio> <dev|prod> [clave=valor ...]"
@@ -122,6 +128,7 @@ case "$ACCION" in
 
   menu)
     echo "rutas                                     aplica servicios.yaml (por stdin)"
+    echo "nginx                                     valida y aplica la config de nginx (tar por stdin)"
     echo "imagen   <servicio> <entorno> [k=v ...]   despliega una imagen (tar por stdin)"
     echo "estado   <servicio> <entorno>             estado del contenedor"
     echo "registro <servicio> <entorno>             ultimas 50 lineas de log"

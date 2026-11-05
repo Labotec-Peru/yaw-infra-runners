@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+Aplica la configuracion de nginx del repo gitops (nginx.conf + conf.d/*.conf
++ renovar_certificados.sh) recibida por stdin como tar(.gz). Lo invoca
+servicio-init.sh con la accion 'nginx'.
+
+Validaciones ANTES de tocar nada:
+  - solo se aceptan: nginx.conf, renovar_certificados.sh y conf.d/*.conf
+  - sin rutas absolutas, sin '..', sin enlaces, sin directorios
+  - cada archivo <= 64 KB y el tar <= 2 MB
+  - server_name valido: termina en .puyu-iot.com (o '_' en el default)
+  - sin server_name duplicado entre archivos
+  - el backend (set $backend http://X:80 / proxy_pass http://X:80) debe ser
+    un nombre de contenedor valido
+  - SINTAXIS real: 'nginx -t' en un contenedor desechable (misma imagen del
+    nginx del host) con los archivos nuevos y los certs de letsencrypt.
+
+Si todo pasa, se aplica de forma atomica: respaldo del estado anterior,
+copia a /opt/nginx, 'nginx -t' real y reload. Si el -t real falla, se
+restaura el respaldo y se recarga.
+"""
+import os, re, sys, syslog, tarfile, shutil, subprocess
+
+NGINX_DIR    = "/opt/nginx"
+NGINX_CONF   = os.path.join(NGINX_DIR, "nginx.conf")
+NGINX_CONF_D = os.path.join(NGINX_DIR, "conf.d")
+RENOVAR      = os.path.join(NGINX_DIR, "renovar_certificados.sh")
+CERTS_HOST   = os.path.join(NGINX_DIR, "certs")
+CERTBOT_HOST = "/var/www/certbot"
+IMAGEN_NGINX = "nginx:1.27"
+STAGING      = "/var/lib/puyu/nginx-staging"
+BACKUP       = "/var/lib/puyu/nginx-backup"
+MAX_FILE     = 64 * 1024
+MAX_TAR      = 2 * 1024**2
+IP           = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
+
+CONF_OK    = re.compile(r"^conf\.d/[A-Za-z0-9][A-Za-z0-9._-]*\.conf$")
+NAME_OK    = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}$")
+DOMINIO_OK = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9-]+)+$")
+
+
+def log(m):
+    syslog.openlog("puyu-nginx", syslog.LOG_PID)
+    syslog.syslog(f"ip={IP} {m}")
+
+
+def morir(m):
+    log(f"RECHAZADO {m}")
+    print(f"ERROR: {m}", file=sys.stderr)
+    sys.exit(1)
+
+
+def docker(*a, timeout=120):
+    return subprocess.run(["docker", *a], capture_output=True,
+                          text=True, timeout=timeout)
+
+
+def revisar_conf(nombre, datos, dominios):
+    texto = datos.decode("utf-8", errors="replace")
+    for m in re.finditer(r"server_name\s+([^;]+);", texto):
+        for d in m.group(1).split():
+            if d == "_":
+                continue
+            if not d.endswith(".puyu-iot.com") or \
+               not DOMINIO_OK.match(d[:-len(".puyu-iot.com")]):
+                morir(f"{nombre}: server_name invalido: {d!r}")
+            if d in dominios:
+                morir(f"server_name duplicado: {d} "
+                      f"(ya estaba en {dominios[d]})")
+            dominios[d] = nombre
+    for m in re.finditer(
+            r"(?:set\s+\$backend|proxy_pass)\s+http://"
+            r"([A-Za-z0-9][A-Za-z0-9._-]*):80", texto):
+        if not NAME_OK.match(m.group(1)):
+            morir(f"{nombre}: backend invalido: {m.group(1)!r}")
+
+
+def recibir_tar():
+    if os.path.exists(STAGING):
+        shutil.rmtree(STAGING)
+    os.makedirs(os.path.join(STAGING, "conf.d"))
+
+    total = 0
+    vistos = set()
+    dominios = {}
+    con_nginx_conf = False
+
+    try:
+        with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as tar:
+            for miembro in tar:
+                nombre = miembro.name
+                if nombre.startswith("./"):
+                    nombre = nombre[2:]
+                if miembro.isdir():
+                    continue
+                if nombre not in ("nginx.conf", "renovar_certificados.sh") \
+                   and not CONF_OK.match(nombre):
+                    morir(f"archivo no permitido en el tar: {nombre!r}")
+                if miembro.issym() or miembro.islnk():
+                    morir(f"enlaces no permitidos: {nombre}")
+                if not miembro.isfile():
+                    morir(f"entrada no regular: {nombre}")
+                if miembro.size > MAX_FILE:
+                    morir(f"{nombre} excede {MAX_FILE // 1024} KB")
+                total += miembro.size
+                if total > MAX_TAR:
+                    morir("el tar excede 2 MB")
+                if nombre in vistos:
+                    morir(f"archivo duplicado en el tar: {nombre}")
+                vistos.add(nombre)
+                if nombre == "nginx.conf":
+                    con_nginx_conf = True
+
+                f = tar.extractfile(miembro)
+                if f is None:
+                    continue
+                datos = f.read()
+                with open(os.path.join(STAGING, nombre), "wb") as salida:
+                    salida.write(datos)
+                if nombre.startswith("conf.d/"):
+                    revisar_conf(nombre, datos, dominios)
+    except tarfile.TarError as ex:
+        morir(f"el stdin no es un tar valido: {ex}")
+
+    if not con_nginx_conf:
+        morir("falta nginx.conf en el tar")
+    return dominios
+
+
+def validar_sintaxis():
+    r = docker("run", "--rm",
+               "-v", f"{STAGING}/nginx.conf:/etc/nginx/nginx.conf:ro",
+               "-v", f"{STAGING}/conf.d:/etc/nginx/conf.d:ro",
+               "-v", f"{CERTS_HOST}:/etc/letsencrypt:ro",
+               "-v", f"{CERTBOT_HOST}:/var/www/certbot:ro",
+               IMAGEN_NGINX, "nginx", "-t")
+    if r.returncode != 0:
+        morir("la config no pasa 'nginx -t':\n" +
+              (r.stderr or r.stdout)[:1500])
+
+
+def respaldar():
+    if os.path.exists(BACKUP):
+        shutil.rmtree(BACKUP)
+    os.makedirs(os.path.join(BACKUP, "conf.d"))
+    if os.path.isfile(NGINX_CONF):
+        shutil.copy2(NGINX_CONF, os.path.join(BACKUP, "nginx.conf"))
+    if os.path.isfile(RENOVAR):
+        shutil.copy2(RENOVAR, os.path.join(BACKUP, "renovar_certificados.sh"))
+    for f in os.listdir(NGINX_CONF_D):
+        p = os.path.join(NGINX_CONF_D, f)
+        if os.path.isfile(p):
+            shutil.copy2(p, os.path.join(BACKUP, "conf.d", f))
+
+
+def restaurar():
+    for f in os.listdir(NGINX_CONF_D):
+        p = os.path.join(NGINX_CONF_D, f)
+        if os.path.isfile(p):
+            os.remove(p)
+    for f in os.listdir(os.path.join(BACKUP, "conf.d")):
+        shutil.copy2(os.path.join(BACKUP, "conf.d", f), NGINX_CONF_D)
+    if os.path.isfile(os.path.join(BACKUP, "nginx.conf")):
+        shutil.copy2(os.path.join(BACKUP, "nginx.conf"), NGINX_CONF)
+    if os.path.isfile(os.path.join(BACKUP, "renovar_certificados.sh")):
+        shutil.copy2(os.path.join(BACKUP, "renovar_certificados.sh"), RENOVAR)
+        os.chmod(RENOVAR, 0o700)
+    docker("exec", "nginx", "nginx", "-s", "reload")
+
+
+def aplicar():
+    respaldar()
+
+    for f in os.listdir(NGINX_CONF_D):
+        p = os.path.join(NGINX_CONF_D, f)
+        if os.path.isfile(p):
+            os.remove(p)
+    for f in os.listdir(os.path.join(STAGING, "conf.d")):
+        shutil.copy2(os.path.join(STAGING, "conf.d", f), NGINX_CONF_D)
+    shutil.copy2(os.path.join(STAGING, "nginx.conf"), NGINX_CONF)
+    if os.path.isfile(os.path.join(STAGING, "renovar_certificados.sh")):
+        shutil.copy2(os.path.join(STAGING, "renovar_certificados.sh"), RENOVAR)
+        os.chmod(RENOVAR, 0o700)
+
+    r = docker("exec", "nginx", "nginx", "-t")
+    if r.returncode != 0:
+        print("!! 'nginx -t' real fallo tras aplicar; restaurando respaldo",
+              file=sys.stderr)
+        restaurar()
+        morir("la config aplicada no paso el 'nginx -t' real; "
+              "se restauro el estado anterior")
+
+
+def main():
+    os.umask(0o077)
+    dominios = recibir_tar()
+    validar_sintaxis()
+    aplicar()
+    print(f"OK nginx: {len(dominios)} dominio(s) revisados; "
+          f"nginx.conf + conf.d aplicados y recargados")
+    log(f"OK dominios={len(dominios)} aplicados")
+
+
+if __name__ == "__main__":
+    main()

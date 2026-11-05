@@ -3,13 +3,13 @@
 set -euo pipefail
 DESTINO="${1:?uso: ./instalar.sh <usuario@host>}"
 
-python3 -m py_compile bin/puyu-alta bin/puyu-deploy bin/puyu-revisar bin/puyu-token
+python3 -m py_compile bin/puyu-alta bin/puyu-deploy bin/puyu-revisar bin/puyu-token bin/puyu-nginx
 bash -n bin/servicio-init.sh
 sh -n bin/puyu-git-askpass
 echo "--- sintaxis OK"
 
 scp -O bin/puyu-alta bin/puyu-deploy bin/puyu-revisar bin/puyu-token \
-  bin/puyu-git-askpass bin/servicio-init.sh "$DESTINO":/tmp/
+  bin/puyu-nginx bin/puyu-git-askpass bin/servicio-init.sh "$DESTINO":/tmp/
 
 ssh "$DESTINO" '
   set -e
@@ -24,12 +24,12 @@ ssh "$DESTINO" '
   }
   install -d -m 700 -o jenkins -g jenkins /home/jenkins/.ssh
 
-  for f in puyu-alta puyu-deploy puyu-revisar puyu-token puyu-git-askpass servicio-init.sh; do
+  for f in puyu-alta puyu-deploy puyu-revisar puyu-token puyu-nginx puyu-git-askpass servicio-init.sh; do
     install -m 755 -o root -g root "/tmp/$f" "/usr/local/bin/$f"
     rm -f "/tmp/$f"
   done
   python3 -m py_compile /usr/local/bin/puyu-alta /usr/local/bin/puyu-deploy \
-    /usr/local/bin/puyu-revisar /usr/local/bin/puyu-token
+    /usr/local/bin/puyu-revisar /usr/local/bin/puyu-token /usr/local/bin/puyu-nginx
 
   cat > /etc/sudoers.d/jenkins-alta <<SUDO
 Defaults:jenkins env_keep += "SSH_CLIENT SSH_CONNECTION SSH_ORIGINAL_COMMAND"
