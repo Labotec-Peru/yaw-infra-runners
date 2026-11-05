@@ -145,5 +145,14 @@ case "$ACCION" in
     echo "toda imagen pasa por puyu-revisar antes del docker load."
     ;;
 
-  *) morir "accion no permitida: $ACCION" ;;
+  *)
+    # Accion desconocida: puede ser una accion NUEVA agregada al repo. Se
+    # auto-actualiza y reintenta UNA vez (exec con el binario recien
+    # instalado); si sigue sin existir, rechaza.
+    if [ "${PUYU_REINTENTO:-0}" = "0" ]; then
+      actualizar_bins
+      PUYU_REINTENTO=1 exec "$BIN/servicio-init.sh"
+    fi
+    morir "accion no permitida: $ACCION"
+    ;;
 esac
