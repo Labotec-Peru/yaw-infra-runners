@@ -7,15 +7,19 @@ Flujo:
      conf.d/*.conf; sin rutas absolutas, '..' ni enlaces; tamanos acotados).
   2. Valida server_name (bajo .puyu-iot.com, duplicados http/https como aviso)
      y backends (nombre valido de contenedor).
-  3. Genera la lista DOMAINS del renovar_certificados.sh desde los conf.d.
-  4. Certificados idempotentes: emite los faltantes, renueva los vencidos y
+  3. Verifica que cada backend http://NOMBRE:80 apunte a un contenedor que
+     exista. Un nombre casi identico (segmentos permutados o diferencia
+     minima) se rechaza con sugerencia: es un typo, no un servicio sin
+     desplegar. Un backend sin contenedor y sin parecidos solo avisa.
+  4. Genera la lista DOMAINS del renovar_certificados.sh desde los conf.d.
+  5. Certificados idempotentes: emite los faltantes, renueva los vencidos y
      no toca los sanos (certbot --keep-until-expiring).
-  5. Valida sintaxis real con 'nginx -t' en un contenedor desechable (misma
+  6. Valida sintaxis real con 'nginx -t' en un contenedor desechable (misma
      imagen del nginx del host, certs y certbot montados).
-  6. Aplica de forma atomica: respaldo del estado anterior, copia a
+  7. Aplica de forma atomica: respaldo del estado anterior, copia a
      /opt/nginx, 'nginx -t' real y reload. Si el -t real falla, restaura.
 """
-import os, re, sys, syslog, tarfile, shutil, subprocess
+import os, re, sys, syslog, tarfile, shutil, subprocess, difflib
 
 NGINX_DIR    = "/opt/nginx"
 NGINX_CONF   = os.path.join(NGINX_DIR, "nginx.conf")
@@ -60,8 +64,9 @@ def docker(*a, timeout=120):
                           text=True, timeout=timeout)
 
 
-def revisar_conf(nombre, datos, dominios):
-    """Valida server_name y backends de un conf y acumula los dominios."""
+def revisar_conf(nombre, datos, dominios, backends):
+    """Valida server_name y backends de un conf; acumula los dominios y los
+    nombres de contenedor de cada http://NOMBRE:80."""
     texto = datos.decode("utf-8", errors="replace")
     for m in re.finditer(r"server_name\s+([^;]+);", texto):
         for d in m.group(1).split():
@@ -80,10 +85,42 @@ def revisar_conf(nombre, datos, dominios):
             r"([A-Za-z0-9][A-Za-z0-9._-]*):80", texto):
         if not NAME_OK.match(m.group(1)):
             morir(f"{nombre}: backend invalido: {m.group(1)!r}")
+        backends.add(m.group(1))
+
+
+def cercano(a, b):
+    """True si dos nombres difieren como para ser un typo: mismos segmentos
+    en distinto orden, o mismo largo con diferencia minima. No marca pares
+    dev/prod (difieren en largo)."""
+    if sorted(a.split("-")) == sorted(b.split("-")):
+        return True
+    if len(a) == len(b):
+        return difflib.SequenceMatcher(None, a, b).ratio() >= 0.9
+    return False
+
+
+def validar_backends(backends):
+    """Rechaza backends que no existen como contenedor cuando hay un nombre
+    casi identico corriendo (typo), y avisa si simplemente no hay contenedor
+    (front sin desplegar todavia)."""
+    if not backends:
+        return
+    r = docker("ps", "--format", "{{.Names}}")
+    vivos = {n for n in (r.stdout or "").split() if n}
+    for b in sorted(backends):
+        if b in vivos:
+            continue
+        parecidos = sorted(n for n in vivos if cercano(b, n))
+        if parecidos:
+            morir(f"backend {b} no existe como contenedor; "
+                  f"quiza quisiste decir: {', '.join(parecidos)}")
+        aviso(f"backend {b}: no hay contenedor con ese nombre todavia "
+              f"(front sin desplegar o nombre por verificar)")
 
 
 def recibir_tar():
-    """Extrae y valida el tar de stdin en STAGING; devuelve los dominios."""
+    """Extrae y valida el tar de stdin en STAGING; devuelve (dominios,
+    backends) para validar certificados y contenedores."""
     if os.path.exists(STAGING):
         shutil.rmtree(STAGING)
     os.makedirs(os.path.join(STAGING, "conf.d"))
@@ -91,6 +128,7 @@ def recibir_tar():
     total = 0
     vistos = set()
     dominios = {}
+    backends = set()
     con_nginx_conf = False
 
     try:
@@ -126,13 +164,13 @@ def recibir_tar():
                 with open(os.path.join(STAGING, nombre), "wb") as salida:
                     salida.write(datos)
                 if nombre.startswith("conf.d/"):
-                    revisar_conf(nombre, datos, dominios)
+                    revisar_conf(nombre, datos, dominios, backends)
     except tarfile.TarError as ex:
         morir(f"el stdin no es un tar valido: {ex}")
 
     if not con_nginx_conf:
         morir("falta nginx.conf en el tar")
-    return dominios
+    return dominios, backends
 
 
 def validar_sintaxis():
@@ -260,9 +298,11 @@ def aplicar():
 
 
 def main():
-    """Punto de entrada: recibir, validar, certificados, aplicar y recargar."""
+    """Punto de entrada: recibir, validar backends, certificados, aplicar y
+    recargar."""
     os.umask(0o077)
-    dominios = recibir_tar()
+    dominios, backends = recibir_tar()
+    validar_backends(backends)
     generar_renovar(dominios)
     renovar_certs(dominios)
     validar_sintaxis()
