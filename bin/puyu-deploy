@@ -403,6 +403,34 @@ def esperar(cfg, cont, intentos=None):
     return False
 
 
+def nombre_resuelve(cont):
+    """True si el nombre del contenedor resuelve en el DNS embebido de Docker
+    (127.0.0.11) visto desde el propio contenedor: la misma vista que tiene
+    el nginx del host para llegar a los fronts."""
+    r = docker("exec", cont, "getent", "hosts", cont, timeout=15)
+    return r.returncode == 0 and \
+        re.search(r"\d+\.\d+\.\d+\.\d+", r.stdout or "") is not None
+
+
+def asegurar_dns(cfg, cont):
+    """Garantiza que el nombre del front resuelva en home-net.
+
+    dockerd a veces no registra el nombre en su DNS embebido al crear el
+    contenedor (race de libnetwork): el health check por IP pasa pero nginx
+    responde 502 'Host not found'. Reconectar la red fuerza el re-registro.
+    """
+    for i in range(5):
+        if nombre_resuelve(cont):
+            print(f"  nombre {cont} resuelve en {RED}")
+            return True
+        print(f"  nombre {cont} no resuelve aun; re-registrando en {RED} "
+              f"(intento {i + 1})", file=sys.stderr)
+        docker("network", "disconnect", RED, cont)
+        docker("network", "connect", RED, cont)
+        time.sleep(2)
+    return False
+
+
 def purgar(base, tag_actual, conservar):
     """Borra imagenes viejas de base conservando las N mas recientes."""
     r = docker("images", base, "--format", "{{.Tag}}")
@@ -547,6 +575,19 @@ def main():
                   "para ver si termino de arrancar.", file=sys.stderr)
             sys.exit(1)
         rollback(cfg, cont, viejo)
+        sys.exit(1)
+
+    if cfg["tipo"] == "front" and not asegurar_dns(cfg, cont):
+        if accion == "desplegar" and existe(viejo):
+            print("!! nombre sin resolver tras el deploy; restaurando la "
+                  "version anterior", file=sys.stderr)
+            rollback(cfg, cont, viejo)
+        else:
+            log(f"SIN DNS {cont}: el contenedor quedo corriendo "
+                f"(accion={accion})")
+            print(f"!! {cont} esta sano por IP pero su nombre no resuelve "
+                  f"en {RED}: nginx responderia 502. Reintenta el deploy.",
+                  file=sys.stderr)
         sys.exit(1)
 
     if existe(viejo):
