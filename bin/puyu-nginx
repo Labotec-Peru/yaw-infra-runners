@@ -143,8 +143,20 @@ def validar_sintaxis():
                "-v", f"{CERTBOT_HOST}:/var/www/certbot:ro",
                IMAGEN_NGINX, "nginx", "-t")
     if r.returncode != 0:
-        morir("la config no pasa 'nginx -t':\n" +
-              (r.stderr or r.stdout)[:1500])
+        salida = r.stderr or r.stdout
+        faltan = set(re.findall(
+            r'cannot load certificate "/etc/letsencrypt/live/([^"]+)/fullchain\.pem"',
+            salida))
+        hint = ""
+        if faltan:
+            hint = ("\nCertificados faltantes: " + ", ".join(sorted(faltan)) +
+                    "\n  Genera primero (uno por dominio):\n" +
+                    "  docker run --rm -v /opt/nginx/certs:/etc/letsencrypt " +
+                    "-v /var/www/certbot:/var/www/certbot certbot/certbot:latest " +
+                    "certonly --webroot -w /var/www/certbot --non-interactive " +
+                    "--agree-tos --no-eff-email --keep-until-expiring " +
+                    "--key-type ecdsa --email labotecperupuyu@gmail.com -d <dominio>")
+        morir("la config no pasa 'nginx -t':\n" + salida[:1500] + hint)
 
 
 def generar_renovar(dominios):
