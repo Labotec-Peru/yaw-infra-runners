@@ -52,6 +52,10 @@ def morir(m):
     sys.exit(1)
 
 
+def aviso(m):
+    print(f"  aviso: {m}", file=sys.stderr)
+
+
 def docker(*a, timeout=120):
     return subprocess.run(["docker", *a], capture_output=True,
                           text=True, timeout=timeout)
@@ -67,8 +71,10 @@ def revisar_conf(nombre, datos, dominios):
                not DOMINIO_OK.match(d[:-len(".puyu-iot.com")]):
                 morir(f"{nombre}: server_name invalido: {d!r}")
             if d in dominios:
-                morir(f"server_name duplicado: {d} "
-                      f"(ya estaba en {dominios[d]})")
+                # legal en nginx: mismo server_name en bloques http y https
+                aviso(f"server_name repetido: {d} "
+                      f"(en {dominios[d]} y {nombre})")
+                continue
             dominios[d] = nombre
     for m in re.finditer(
             r"(?:set\s+\$backend|proxy_pass)\s+http://"
