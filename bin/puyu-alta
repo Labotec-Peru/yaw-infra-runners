@@ -154,7 +154,7 @@ def kong(svc, ent, e):
 
     st, _ = api("PUT", f"/services/{nombre_k}/routes/{ruta_k}", {
         "name": ruta_k, "hosts": [host], "paths": [kp],
-        "strip_path": strip, "protocols": ["https"]})
+        "strip_path": strip, "protocols": ["http", "https"]})
     if st not in (200, 201):
         errores.append(f"{ruta_k}: Kong rechazo la ruta (HTTP {st})")
         return
