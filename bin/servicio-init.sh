@@ -122,6 +122,7 @@ case "$ACCION" in
     [ -n "${SERVICIO:-}" ] && [ -n "${ENTORNO:-}" ] \
       || morir "uso: $ACCION <servicio> <dev|prod>"
     [ -s "$CACHE" ] || morir "no hay servicios.yaml aplicado"
+    actualizar_bins
     PUYU_SERVICIOS="$CACHE" "$BIN/puyu-deploy" "$ACCION" "$SERVICIO" "$ENTORNO" \
       "${EXTRA[@]+${EXTRA[@]}}"
     ;;
