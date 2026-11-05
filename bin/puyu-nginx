@@ -139,6 +139,23 @@ def validar_sintaxis():
               (r.stderr or r.stdout)[:1500])
 
 
+def generar_renovar(dominios):
+    """El renovar_certificados.sh del repo es un TEMPLATE con el marcador
+    '# @@DOMAINS@@': aqui se rellena con los server_name de los conf.d
+    aplicados, asi la lista nunca se edita a mano."""
+    ruta = os.path.join(STAGING, "renovar_certificados.sh")
+    if not os.path.isfile(ruta):
+        return
+    with open(ruta, encoding="utf-8", errors="replace") as f:
+        texto = f.read()
+    if "# @@DOMAINS@@" not in texto:
+        return
+    lineas = "\n".join(f"  {d}" for d in sorted(dominios))
+    texto = texto.replace("# @@DOMAINS@@", lineas)
+    with open(ruta, "w", encoding="utf-8") as f:
+        f.write(texto)
+
+
 def respaldar():
     if os.path.exists(BACKUP):
         shutil.rmtree(BACKUP)
@@ -194,6 +211,7 @@ def aplicar():
 def main():
     os.umask(0o077)
     dominios = recibir_tar()
+    generar_renovar(dominios)
     validar_sintaxis()
     aplicar()
     print(f"OK nginx: {len(dominios)} dominio(s) revisados; "
