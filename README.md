@@ -101,6 +101,8 @@ un binario malicioso bajo la etiqueta correcta: para eso hace falta firma.
 
 `--cap-drop ALL`, `--read-only`, `--user` del YAML, `--pids-limit 512`,
 `no-new-privileges`, limites de memoria y CPU, HTTP publicado solo en `127.0.0.1`.
+El `/tmp` de los back es un tmpfs `nosuid` pero CON ejecucion: los JVM extraen
+ahi sus librerias nativas (Netty epoll, etc.) y con `noexec` no pueden cargarlas.
 
 El `0.0.0.0` del puerto TCP es explicito a proposito: `daemon.json` tiene
 `"ip": "127.0.0.1"`, asi que un `-p 5010:5010` sin IP publicaria solo en loopback

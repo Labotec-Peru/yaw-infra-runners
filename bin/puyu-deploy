@@ -353,7 +353,11 @@ def arrancar(cfg, cont, tag):
             cmd += ["-p", f"127.0.0.1:{host_p}:{cont_p}"]
         cmd += ["--user", cfg["uid"],
                 "--read-only",
-                "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m"]
+                # Sin 'noexec' a proposito: los JVM extraen a /tmp sus librerias
+                # nativas (Netty epoll, jansi, etc.) y con noexec el dlopen
+                # falla con "Operation not permitted". El resto del fs sigue
+                # read-only y el tmpfs conserva nosuid.
+                "--tmpfs", "/tmp:rw,nosuid,size=256m"]
         if cfg["java_opts"]:
             cmd += ["-e", "JAVA_TOOL_OPTIONS=" + cfg["java_opts"].replace(",", " ")]
     else:
