@@ -113,6 +113,9 @@ IOC_EXENTOS_DEFAULT = {
     # el usuario 'cron' del sistema tiene home /var/spool/cron
     "etc/passwd":  {"manipulacion de cron"},
     "etc/passwd-": {"manipulacion de cron"},
+    # el bundle minificado de un front trae cualquier puerto de 4-5 digitos:
+    # el patron de puertos de pool es ruido puro ahi.
+    "usr/share/nginx/html/*": {"puerto tipico de pool de minado"},
 }
 
 
@@ -127,6 +130,18 @@ def ioc_exentos():
         ruta, patron = linea.split("|", 1)
         d.setdefault(ruta.strip(), set()).add(patron.strip())
     return d
+
+
+def exento_ioc(ruta, que):
+    """True si el par (ruta, patron) esta exento. Las claves terminadas en '*'
+    aplican a todo el prefijo (ej. usr/share/nginx/html/*)."""
+    for clave, patrones in IOC_EXENTOS.items():
+        if clave.endswith("*"):
+            if ruta.startswith(clave[:-1]) and que in patrones:
+                return True
+        elif ruta == clave and que in patrones:
+            return True
+    return False
 
 
 IOC_EXENTOS = ioc_exentos()
@@ -239,8 +254,8 @@ def revisar_entrada(ti, datos, capa, tipo):
     if datos and not es_elf:
         for rx, que in IOC:
             if rx.search(datos):
-                if que in IOC_EXENTOS.get(ruta, ()):
-                    aviso(f"{que} en /{ruta} (patron exento en archivo de la imagen base)  [capa {capa}]")
+                if exento_ioc(ruta, que):
+                    aviso(f"{que} en /{ruta} (patron exento)  [capa {capa}]")
                 else:
                     rechaza(f"{que} en /{ruta}  [capa {capa}]")
         raras = ip_sospechosa(datos)

@@ -18,3 +18,9 @@
 etc/busybox-paths.d/busybox | tecnica de persistencia u ocultamiento
 etc/passwd | manipulacion de cron
 etc/passwd- | manipulacion de cron
+
+# ── webroot de los fronts ────────────────────────────────────────────────────
+# El bundle JS minificado trae cualquier puerto de 4-5 digitos: el patron de
+# puertos de pool es ruido puro ahi. El '*' aplica la exencion a todo el
+# prefijo (los nombres de los assets cambian en cada build).
+usr/share/nginx/html/* | puerto tipico de pool de minado
