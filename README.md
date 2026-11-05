@@ -32,6 +32,10 @@ exitoso, guardada por `puyu-deploy` en `/var/lib/puyu/cfg/<contenedor>.json`
 anterior), el contenedor se deja corriendo para inspeccion en vez de
 eliminarlo.
 
+La membresia de `servicios.yaml` aplica SOLO a los `back` (tienen ruta Kong
+y `.env`). Los `front` no pasan por el registro: se declaran en el nginx del
+host, que los alcanza por nombre en `home-net`.
+
 > El sudoers de jenkins debe preservar `SSH_ORIGINAL_COMMAND` (`env_keep`),
 > ademas de `SSH_CLIENT` y `SSH_CONNECTION`: sin ella, `sudo` la borra y el
 > menu ve el comando vacio. `instalar.sh` ya la incluye.

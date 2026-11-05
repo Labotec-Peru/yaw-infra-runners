@@ -17,9 +17,10 @@ De donde sale cada cosa
 Del PIPELINE (devops/vars/<entorno>.vars.yml, via los pares clave=valor):
     tipo puertos env mem reserva cpus pids java_opts salud reintentos conservar
 
-Del REGISTRO (servicios.yaml, solo esto):
+Del REGISTRO (servicios.yaml, SOLO para tipo=back):
     que el servicio este declarado. Nada de construccion: servicios.yaml es
-    rutas de Kong y carpetas, no un plan de despliegue.
+    rutas de Kong y carpetas, no un plan de despliegue. Los front no pasan
+    por el registro: se declaran en el nginx del host.
 
 Antes de cargar la imagen se la pasa a puyu-revisar, que recorre las capas
 buscando binarios plantados, setuid, nombres de mineros y URLs de pools. Si
@@ -464,8 +465,6 @@ def main():
     if not ENTORNO_OK.match(entorno):
         morir(f"entorno invalido: {entorno!r}")
 
-    declarado(nombre, entorno)
-
     cont  = nombre if entorno == "prod" else f"{nombre}-dev"
     viejo = f"{cont}_old"
 
@@ -499,6 +498,12 @@ def main():
             morir("revertir no admite parametros: re-arranca con la config "
                   "del ultimo deploy exitoso")
         cfg = cargar_cfg(cont)
+
+    # Membresia: SOLO los back requieren estar en servicios.yaml (tienen ruta
+    # Kong y .env). Los front no: se declaran en el nginx del host, asi que el
+    # menu los despliega sin exigir registro.
+    if cfg.get("tipo") == "back":
+        declarado(nombre, entorno)
 
     if cfg.get("env"):
         validar_env(cfg["env"])
