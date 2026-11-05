@@ -36,7 +36,9 @@ IP           = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
 
 CONF_OK    = re.compile(r"^conf\.d/[A-Za-z0-9][A-Za-z0-9._-]*\.conf$")
 NAME_OK    = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}$")
-DOMINIO_OK = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9-]+)+$")
+# una o varias etiquetas DNS separadas por puntos (admite nombres base sin
+# subdominio, ej. apisprod, ota-server)
+DOMINIO_OK = re.compile(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$")
 
 
 def log(m):
