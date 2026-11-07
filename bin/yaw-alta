@@ -10,7 +10,7 @@ y plugins en lista blanca.
 import os, re, sys, json, hashlib, syslog, urllib.request, urllib.error, yaml
 
 ADMIN      = os.environ.get("KONG_ADMIN", "http://127.0.0.1:8001")
-HOSTS      = {"prod": "apisprod.yaw-iot.com", "dev": "apisdev.yaw-iot.com"}
+HOSTS      = {"prod": "api.yaw-iot.com", "dev": "api-dev.yaw-iot.com"}
 DOMINIO    = ".yaw-iot.com"
 PLUGINS_OK = {"rate-limiting", "cors", "key-auth", "ip-restriction",
               "request-size-limiting", "bot-detection"}
