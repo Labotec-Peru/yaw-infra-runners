@@ -3,7 +3,7 @@
 #
 # Formato por linea:  <ruta-en-el-tar> | <nombre-exacto-del-patron>
 #
-# Patrones validos (nombre exacto que imprime puyu-revisar):
+# Patrones validos (nombre exacto que imprime yaw-revisar):
 #   URL de pool de minado (stratum)
 #   referencia a software o pool de minado
 #   descarga encadenada a un shell (curl|sh)

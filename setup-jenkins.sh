@@ -1,6 +1,6 @@
 #!/bin/bash
 # Corre en el servidor como root: crea la llave de Jenkins y la ata al menu.
-# Uso local (PowerShell):  Get-Content setup-jenkins.sh -Raw | ssh puyu 'bash -s'
+# Uso local (PowerShell):  Get-Content setup-jenkins.sh -Raw | ssh root@173.249.36.100 'bash -s'
 set -euo pipefail
 
 # usuario jenkins sin shell util y con la carpeta .ssh

@@ -21,7 +21,7 @@ Del REGISTRO (servicios.yaml, SOLO para tipo=back):
     rutas de Kong y carpetas, no un plan de despliegue. Los front no pasan
     por el registro: se declaran en el nginx del host.
 
-Antes de cargar la imagen se la pasa a puyu-revisar, que recorre las capas
+Antes de cargar la imagen se la pasa a yaw-revisar, que recorre las capas
 buscando binarios plantados, setuid, nombres de mineros y URLs de pools. Si
 el revisor rechaza, no se hace docker load y el contenedor viejo sigue vivo.
 
@@ -36,8 +36,8 @@ import hashlib, tarfile, tempfile, subprocess, urllib.request, urllib.error
 import yaml
 
 RED      = "home-net"
-LOCK     = "/run/puyu-deploy.lock"
-REGISTRO = os.environ.get("PUYU_SERVICIOS", "/var/lib/yaw/servicios.yaml")
+LOCK     = "/run/yaw-deploy.lock"
+REGISTRO = os.environ.get("YAW_SERVICIOS", "/var/lib/yaw/servicios.yaml")
 TMPDIR   = "/var/lib/yaw"
 MAX_TAR  = 2 * 1024**3
 MIN_TAR  = 1 * 1024**2
@@ -75,8 +75,8 @@ TOPES = {"cpus": 8.0, "pids": 4096}
 
 
 def log(m):
-    """Registra en syslog con el tag puyu-deploy."""
-    syslog.openlog("puyu-deploy", syslog.LOG_PID)
+    """Registra en syslog con el tag yaw-deploy."""
+    syslog.openlog("yaw-deploy", syslog.LOG_PID)
     syslog.syslog(f"ip={IP} {m}")
 
 
@@ -268,9 +268,9 @@ def etiqueta_del_tar(ruta):
 
 
 def revisar_imagen(ruta, tipo):
-    """Pasa la imagen a puyu-revisar antes del docker load; si falta el
+    """Pasa la imagen a yaw-revisar antes del docker load; si falta el
     revisor se aborta (fallar abierto seria no revisar nada)."""
-    rev = "/usr/local/bin/puyu-revisar"
+    rev = "/usr/local/bin/yaw-revisar"
     if not os.path.isfile(rev):
         os.remove(ruta)
         morir(f"falta {rev}; sin revisor no se despliega")
@@ -479,7 +479,7 @@ def main():
     desplegar con renombrado atomico, health check y rollback."""
     os.umask(0o077)
     if len(sys.argv) < 4:
-        morir("uso: puyu-deploy <desplegar|estado|registro|revertir> "
+        morir("uso: yaw-deploy <desplegar|estado|registro|revertir> "
               "<servicio> <dev|prod> [clave=valor ...]")
 
     accion, nombre, entorno = sys.argv[1], sys.argv[2], sys.argv[3]

@@ -3,12 +3,12 @@
 LECTURA al repo privado de runners). Labotec-Peru deshabilito las deploy
 keys: este es el reemplazo.
 
-  puyu-token   -> imprime un token valido por stdout
+  yaw-token   -> imprime un token valido por stdout
 
 Firma un JWT (RS256) con la clave privada de la app, pide un token de
 instalacion a la API de GitHub y lo cachea en /var/lib/yaw/token (root 600)
 hasta 5 minutos antes de expirar. El token NUNCA viaja en la linea de
-comandos: lo entrega puyu-git-askpass directo a git.
+comandos: lo entrega yaw-git-askpass directo a git.
 
 Config en /etc/yaw/github-app.conf (root 600):
   APP_ID=123456
@@ -25,8 +25,8 @@ IP      = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
 
 
 def log(m):
-    """Registra en syslog con el tag puyu-token."""
-    syslog.openlog("puyu-token", syslog.LOG_PID)
+    """Registra en syslog con el tag yaw-token."""
+    syslog.openlog("yaw-token", syslog.LOG_PID)
     syslog.syslog(f"ip={IP} {m}")
 
 

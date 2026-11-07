@@ -7,8 +7,8 @@
     Jenkins --ssh--> servicio-init.sh   (root; jenkins NO puede modificarlo)
                           |
                           +-- 0. se actualiza a si mismo desde este repo
-                          +-- rutas   < servicios.yaml  ->  puyu-alta
-                          +-- imagen  < imagen.tar      ->  puyu-deploy
+                          +-- rutas   < servicios.yaml  ->  yaw-alta
+                          +-- imagen  < imagen.tar      ->  yaw-deploy
 
 Jenkins elige una opcion de un menu cerrado. No manda comandos ni parametros de
 ejecucion: puertos, limites y rutas salen de `servicios.yaml`, que pasa por PR
@@ -28,7 +28,7 @@ en `Labotec-Peru/yaw-routes`.
 
 `estado` y `registro` son solo lectura y no reciben parametros. `revertir`
 tampoco: re-arranca el contenedor con la config exacta del ultimo deploy
-exitoso, guardada por `puyu-deploy` en `/var/lib/yaw/cfg/<contenedor>.json`
+exitoso, guardada por `yaw-deploy` en `/var/lib/yaw/cfg/<contenedor>.json`
 (root 600). Si el health check falla en el PRIMER despliegue (sin version
 anterior), el contenedor se deja corriendo para inspeccion en vez de
 eliminarlo.
@@ -68,9 +68,9 @@ controle el repositorio controla root en el servidor.
 
 Labotec-Peru deshabilito las deploy keys. El acceso de solo lectura es una
 **GitHub App** instalada unicamente en este repo (permission `Contents:
-Read`). El token de instalacion lo genera `puyu-token` (JWT RS256 con la
+Read`). El token de instalacion lo genera `yaw-token` (JWT RS256 con la
 clave privada de la app + API de GitHub) y lo cachea en `/var/lib/yaw/token`
-(root 600) hasta 5 minutos antes de expirar. `puyu-git-askpass` se lo entrega
+(root 600) hasta 5 minutos antes de expirar. `yaw-git-askpass` se lo entrega
 a git: el token **nunca** aparece en la linea de comandos ni en `ps`.
 
 Config en `/etc/yaw/github-app.conf` (root 600):
@@ -122,7 +122,7 @@ y los dispositivos no llegarian.
 
 ## Registro
 
-    journalctl -t servicio-init -t puyu-alta -t puyu-deploy --since today
+    journalctl -t servicio-init -t yaw-alta -t yaw-deploy --since today
 
 ## Instalacion
 

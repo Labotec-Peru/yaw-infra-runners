@@ -10,13 +10,13 @@ El tar contiene:
   - llaves/*.pub        claves PUBLICAS, un archivo por dispositivo
 
 De cada usuario del YAML:
-  - usuario del sistema en el grupo puyu-tunel, shell nologin, sin password;
+  - usuario del sistema en el grupo yaw-tunel, shell nologin, sin password;
   - authorized_keys regenerado por completo con permitopen por puerto y
     expiry-time nativo de OpenSSH (la llave deja de valer sola en la fecha);
   - nada de shell ni TTY: solo forwarding a los destinos listados.
 
-Solo toca usuarios del grupo puyu-tunel CON su marcador de propiedad
-(/home/<usuario>/.puyu-tunel): nunca elimina, bloquea ni reescribe cuentas
+Solo toca usuarios del grupo yaw-tunel CON su marcador de propiedad
+(/home/<usuario>/.yaw-tunel): nunca elimina, bloquea ni reescribe cuentas
 que no haya creado este runner. Un nombre del YAML que ya exista en el
 sistema sin el marcador hace fallar la aplicacion con error explicito.
 
@@ -37,15 +37,15 @@ Esquema del tuneles.yaml:
 import os, re, sys, syslog, subprocess, datetime, grp, shutil, tarfile
 import yaml
 
-GRUPO        = "puyu-tunel"
-MARCADOR     = ".puyu-tunel"
+GRUPO        = "yaw-tunel"
+MARCADOR     = ".yaw-tunel"
 COPIA_YAML   = "/var/lib/yaw/tuneles.yaml"
 COPIA_LLAVES = "/var/lib/yaw/tuneles-llaves"
 STAGING      = "/var/lib/yaw/tuneles-staging"
-DROP_IN      = "/etc/ssh/sshd_config.d/puyu-tuneles.conf"
+DROP_IN      = "/etc/ssh/sshd_config.d/yaw-tuneles.conf"
 SSHD_CONF    = "/etc/ssh/sshd_config"
-CRON_RUTA    = "/etc/cron.d/puyu-tuneles"
-CRON_LINEA   = "23 45 * * * root /usr/local/bin/puyu-tuneles --cron\n"
+CRON_RUTA    = "/etc/cron.d/yaw-tuneles"
+CRON_LINEA   = "23 45 * * * root /usr/local/bin/yaw-tuneles --cron\n"
 MAX_YAML     = 64 * 1024
 MAX_LLAVE    = 4 * 1024
 MAX_USUARIOS = 32
@@ -64,8 +64,8 @@ LLAVE_OK   = re.compile(
 
 
 def log(m):
-    """Registra en syslog con el tag puyu-tuneles."""
-    syslog.openlog("puyu-tuneles", syslog.LOG_PID)
+    """Registra en syslog con el tag yaw-tuneles."""
+    syslog.openlog("yaw-tuneles", syslog.LOG_PID)
     syslog.syslog(f"ip={IP} {m}")
 
 
@@ -272,7 +272,7 @@ def expiry_time(fecha):
 
 
 def grupo_existe():
-    """True si el grupo puyu-tunel existe."""
+    """True si el grupo yaw-tunel existe."""
     try:
         grp.getgrnam(GRUPO)
         return True
@@ -281,7 +281,7 @@ def grupo_existe():
 
 
 def miembros_grupo():
-    """Nombres de los miembros actuales del grupo puyu-tunel."""
+    """Nombres de los miembros actuales del grupo yaw-tunel."""
     try:
         return list(grp.getgrnam(GRUPO).gr_mem)
     except KeyError:
@@ -289,7 +289,7 @@ def miembros_grupo():
 
 
 def asegurar_grupo():
-    """Crea el grupo puyu-tunel si falta."""
+    """Crea el grupo yaw-tunel si falta."""
     if grupo_existe():
         return
     r = cmd("groupadd", GRUPO)
@@ -338,12 +338,12 @@ def desplegar_usuario(u, cambios):
             morir(f"useradd {nombre} fallo: {r.stderr.strip()[:200]}")
         marca = f"/home/{nombre}/{MARCADOR}"
         with open(marca, "w", encoding="utf-8") as f:
-            f.write("gestionado por puyu-tuneles\n")
+            f.write("gestionado por yaw-tuneles\n")
         os.chmod(marca, 0o600)
         cambios.append(f"{nombre}: usuario creado (grupo {GRUPO}, nologin)")
     elif not marcado(nombre):
         morir(f"el usuario {nombre} ya existe en el sistema y no fue creado "
-              f"por puyu-tuneles; no lo voy a tocar. Usa otro nombre en el "
+              f"por yaw-tuneles; no lo voy a tocar. Usa otro nombre en el "
               f"YAML o gestiona ese usuario a mano.")
     cmd("usermod", "-g", GRUPO, nombre)
     cmd("passwd", "-l", nombre)
@@ -381,7 +381,7 @@ def purgar_extra(activos, cambios):
 def desplegar_drop_in():
     """Escribe el Match Group de sshd y recarga si cambio algo."""
     contenido = (
-        "# Gestionado por puyu-tuneles. No editar a mano.\n"
+        "# Gestionado por yaw-tuneles. No editar a mano.\n"
         f"Match Group {GRUPO}\n"
         "    PasswordAuthentication no\n"
         "    KbdInteractiveAuthentication no\n"
@@ -420,7 +420,7 @@ def asegurar_include():
     if "sshd_config.d" in texto:
         return False
     with open(SSHD_CONF, "a", encoding="utf-8") as f:
-        f.write("\n# puyu: drop-ins gestionados por puyu-tuneles\n"
+        f.write("\n# yaw: drop-ins gestionados por yaw-tuneles\n"
                 "Include /etc/ssh/sshd_config.d/*.conf\n")
     r = cmd("sshd", "-t")
     if r.returncode != 0:
@@ -518,11 +518,11 @@ def main():
         if crudo is None:
             log("--cron sin copia aplicada: nada que hacer")
             return
-        print("puyu-tuneles --cron: re-aplicando desde la copia guardada")
+        print("yaw-tuneles --cron: re-aplicando desde la copia guardada")
         ejecutar(crudo, archivos)
         return
     if sys.argv[1:]:
-        morir("uso: puyu-tuneles [--cron]  (el tar llega por stdin)")
+        morir("uso: yaw-tuneles [--cron]  (el tar llega por stdin)")
 
     crudo, archivos = recibir_tar()
     ejecutar(crudo, archivos)

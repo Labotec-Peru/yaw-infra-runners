@@ -22,8 +22,8 @@ creados, actualizados, sin_cambios, errores = [], [], [], []
 
 
 def log(m):
-    """Registra en syslog con el tag puyu-alta."""
-    syslog.openlog("puyu-alta", syslog.LOG_PID)
+    """Registra en syslog con el tag yaw-alta."""
+    syslog.openlog("yaw-alta", syslog.LOG_PID)
     syslog.syslog(f"ip={IP} {m}")
 
 

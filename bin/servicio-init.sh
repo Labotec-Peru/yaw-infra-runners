@@ -12,7 +12,7 @@
 #
 # Acciones validas: menu | rutas | nginx | tuneles | imagen <servicio> <dev|prod>
 # [clave=valor ...] | estado | registro | revertir. Aqui solo se valida la
-# FORMA del comando; los pares clave=valor los valida puyu-deploy contra su
+# FORMA del comando; los pares clave=valor los valida yaw-deploy contra su
 # lista blanca.
 
 set -uo pipefail
@@ -27,12 +27,12 @@ log(){ logger -t servicio-init "ip=$IP $*"; }
 morir(){ log "RECHAZADO $*"; echo "ERROR: $*" >&2; exit 1; }
 
 # Auto-actualiza este repo desde origin/main (token de la GitHub App via
-# puyu-git-askpass: nunca viaja en la linea de comandos) y reinstala los
+# yaw-git-askpass: nunca viaja en la linea de comandos) y reinstala los
 # binarios con verificacion de sintaxis.
 actualizar_bins() {
   install -d -m 700 /var/lib/yaw
 
-  export GIT_ASKPASS="$BIN/puyu-git-askpass"
+  export GIT_ASKPASS="$BIN/yaw-git-askpass"
   export GIT_TERMINAL_PROMPT=0
 
   if [ ! -d "$REPO_DIR/.git" ]; then
@@ -48,12 +48,12 @@ actualizar_bins() {
 
   local commit; commit=$(git -C "$REPO_DIR" rev-parse --short HEAD)
 
-  for f in puyu-alta puyu-deploy puyu-revisar puyu-token puyu-nginx puyu-tuneles; do
+  for f in yaw-alta yaw-deploy yaw-revisar yaw-token yaw-nginx yaw-tuneles; do
     [ -f "$REPO_DIR/bin/$f" ] || morir "falta bin/$f en el repo"
     python3 -m py_compile "$REPO_DIR/bin/$f" || morir "bin/$f no compila"
     install -m 755 -o root -g root "$REPO_DIR/bin/$f" "$BIN/$f"
   done
-  for f in puyu-git-askpass; do
+  for f in yaw-git-askpass; do
     [ -f "$REPO_DIR/bin/$f" ] || morir "falta bin/$f en el repo"
     sh -n "$REPO_DIR/bin/$f" || morir "bin/$f no compila"
     install -m 755 -o root -g root "$REPO_DIR/bin/$f" "$BIN/$f"
@@ -89,19 +89,19 @@ case "$ACCION" in
     umask 077
     cat > "$CACHE.nuevo" || morir "no se recibio servicios.yaml"
     [ -s "$CACHE.nuevo" ] || { rm -f "$CACHE.nuevo"; morir "servicios.yaml vacio"; }
-    "$BIN/puyu-alta" < "$CACHE.nuevo" || { rm -f "$CACHE.nuevo"; exit 1; }
+    "$BIN/yaw-alta" < "$CACHE.nuevo" || { rm -f "$CACHE.nuevo"; exit 1; }
     mv "$CACHE.nuevo" "$CACHE"
     chmod 600 "$CACHE"
     ;;
 
   nginx)
     actualizar_bins
-    "$BIN/puyu-nginx"
+    "$BIN/yaw-nginx"
     ;;
 
   tuneles)
     actualizar_bins
-    "$BIN/puyu-tuneles"
+    "$BIN/yaw-tuneles"
     ;;
 
   imagen)
@@ -109,7 +109,7 @@ case "$ACCION" in
       || morir "uso: imagen <servicio> <dev|prod> [clave=valor ...]"
     [ -s "$CACHE" ] || morir "no hay servicios.yaml aplicado; corre rutas primero"
     actualizar_bins
-    PUYU_SERVICIOS="$CACHE" "$BIN/puyu-deploy" desplegar "$SERVICIO" "$ENTORNO" \
+    YAW_SERVICIOS="$CACHE" "$BIN/yaw-deploy" desplegar "$SERVICIO" "$ENTORNO" \
       "${EXTRA[@]+${EXTRA[@]}}"
     ;;
 
@@ -118,7 +118,7 @@ case "$ACCION" in
       || morir "uso: $ACCION <servicio> <dev|prod>"
     [ -s "$CACHE" ] || morir "no hay servicios.yaml aplicado"
     actualizar_bins
-    PUYU_SERVICIOS="$CACHE" "$BIN/puyu-deploy" "$ACCION" "$SERVICIO" "$ENTORNO" \
+    YAW_SERVICIOS="$CACHE" "$BIN/yaw-deploy" "$ACCION" "$SERVICIO" "$ENTORNO" \
       "${EXTRA[@]+${EXTRA[@]}}"
     ;;
 
@@ -139,16 +139,16 @@ case "$ACCION" in
     echo "todos los puertos se publican en 127.0.0.1. Un puerto publico se"
     echo "abre a mano en el servidor, nunca desde el pipeline."
     echo
-    echo "toda imagen pasa por puyu-revisar antes del docker load."
+    echo "toda imagen pasa por yaw-revisar antes del docker load."
     ;;
 
   # Accion desconocida: puede ser una accion NUEVA del repo. Auto-actualiza y
   # reintenta UNA vez con el binario recien instalado; si sigue sin existir,
   # rechaza.
   *)
-    if [ "${PUYU_REINTENTO:-0}" = "0" ]; then
+    if [ "${YAW_REINTENTO:-0}" = "0" ]; then
       actualizar_bins
-      PUYU_REINTENTO=1 exec "$BIN/servicio-init.sh"
+      YAW_REINTENTO=1 exec "$BIN/servicio-init.sh"
     fi
     morir "accion no permitida: $ACCION"
     ;;

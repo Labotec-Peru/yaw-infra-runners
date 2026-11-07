@@ -15,7 +15,7 @@
 # ya sabes que es buena:
 #
 #   docker save mi-servicio:123 > /tmp/i.tar
-#   puyu-revisar --ips back /tmp/i.tar
+#   yaw-revisar --ips back /tmp/i.tar
 #
 # Revisa cada IP que salga ANTES de pegarla aqui. Si no sabes de quien es, no
 # la pegues: averigualo primero.
