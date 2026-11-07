@@ -9,7 +9,7 @@
 estado y registro son solo lectura: no reciben parametros ni los necesitan.
 revertir tampoco recibe parametros del pipeline: re-arranca el contenedor con
 la imagen :previo usando la config EXACTA del ultimo deploy exitoso, guardada
-en /var/lib/puyu/cfg/.
+en /var/lib/yaw/cfg/.
 
 De donde sale cada cosa
 -----------------------
@@ -37,8 +37,8 @@ import yaml
 
 RED      = "home-net"
 LOCK     = "/run/puyu-deploy.lock"
-REGISTRO = os.environ.get("PUYU_SERVICIOS", "/var/lib/puyu/servicios.yaml")
-TMPDIR   = "/var/lib/puyu"
+REGISTRO = os.environ.get("PUYU_SERVICIOS", "/var/lib/yaw/servicios.yaml")
+TMPDIR   = "/var/lib/yaw"
 MAX_TAR  = 2 * 1024**3
 MIN_TAR  = 1 * 1024**2
 MARGEN   = 5 * 1024**3
@@ -48,7 +48,7 @@ IP       = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
 NOMBRE_OK  = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}$")
 ENTORNO_OK = re.compile(r"^(dev|prod)$")
 TAG_OK     = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,95}:[A-Za-z0-9._-]{1,64}$")
-CFG_DIR    = "/var/lib/puyu/cfg"
+CFG_DIR    = "/var/lib/yaw/cfg"
 
 REGLAS = {
     "tipo":       r"front|back",
@@ -184,7 +184,7 @@ def declarado(nombre, entorno):
     svc = next((s for s in svcs if s.get("nombre") == nombre), None)
     if svc is None:
         morir(f"'{nombre}' no esta declarado en servicios.yaml. Agregalo con un "
-              f"PR a puyu-routes y corre el job de rutas. "
+              f"PR a yaw-routes y corre el job de rutas. "
               f"Declarados: {', '.join(sorted(s.get('nombre','?') for s in svcs))}")
     ents = svc.get("entornos") or {}
     if entorno not in ents:

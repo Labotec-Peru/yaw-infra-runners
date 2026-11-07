@@ -27,7 +27,7 @@ chmod 644 /home/jenkins/.ssh/authorized_keys
 echo "== authorized_keys de jenkins (debe verse el command= al inicio):"
 cat /home/jenkins/.ssh/authorized_keys
 echo
-echo "== LLAVE PRIVADA de Jenkins (pegarla en Jenkins como credencial 'puyu-alta',"
+echo "== LLAVE PRIVADA de Jenkins (pegarla en Jenkins como credencial 'yaw-alta',"
 echo "== tipo SSH Username with private key, usuario: jenkins). Despues: shred -u."
 echo "== INICIO LLAVE"
 cat /root/jenkins-alta

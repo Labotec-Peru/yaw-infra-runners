@@ -1,5 +1,5 @@
 #!/bin/bash
-# Instala los runners en un servidor. Uso: ./instalar.sh root@5.189.180.249
+# Instala los runners en un servidor. Uso: ./instalar.sh root@173.249.36.100
 set -euo pipefail
 DESTINO="${1:?uso: ./instalar.sh <usuario@host>}"
 
@@ -15,8 +15,8 @@ ssh "$DESTINO" '
   set -e
   apt-get install -y python3-yaml git >/dev/null
 
-  install -d -m 700 /var/lib/puyu
-  install -d -m 755 /etc/puyu
+  install -d -m 700 /var/lib/yaw
+  install -d -m 755 /etc/yaw
 
   id jenkins >/dev/null 2>&1 || {
     useradd -m -s /bin/bash -c "despliegue desde Jenkins" jenkins
@@ -52,17 +52,17 @@ cat <<'FIN'
 Falta, una sola vez en el servidor:
 
   # 1. GitHub App de solo lectura (la org bloqueo las deploy keys).
-  #    Ya subiste el .pem a /root/.ssh/puyu-runners-app.pem; completa los
+  #    Ya subiste el .pem a /root/.ssh/yaw-runners-app.pem; completa los
   #    IDs (pagina de la app en Developer settings, y la URL de Install):
-  cat > /etc/puyu/github-app.conf <<CONF
+  cat > /etc/yaw/github-app.conf <<CONF
 APP_ID=TU_APP_ID
 INSTALL_ID=TU_INSTALL_ID
-PEM=/root/.ssh/puyu-runners-app.pem
+PEM=/root/.ssh/yaw-runners-app.pem
 CONF
-  chmod 600 /etc/puyu/github-app.conf
+  chmod 600 /etc/yaw/github-app.conf
 
   # 1b. (opcional) exenciones del revisor de imagenes (ver README "Ajustes"):
-  #     cp etc/ioc-exentos.txt /etc/puyu/ioc-exentos.txt
+  #     cp etc/ioc-exentos.txt /etc/yaw/ioc-exentos.txt
 
   # 2. llave de Jenkins, atada al menu
   ssh-keygen -t ed25519 -f /root/jenkins-alta -N "" -C "jenkins-alta"

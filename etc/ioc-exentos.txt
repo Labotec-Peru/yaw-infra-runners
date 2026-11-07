@@ -1,5 +1,5 @@
 # Exenciones IOC: falsos positivos conocidos de las imagenes base.
-# Copiar a /etc/puyu/ioc-exentos.txt en el servidor para ajustar sin tocar codigo.
+# Copiar a /etc/yaw/ioc-exentos.txt en el servidor para ajustar sin tocar codigo.
 #
 # Formato por linea:  <ruta-en-el-tar> | <nombre-exacto-del-patron>
 #

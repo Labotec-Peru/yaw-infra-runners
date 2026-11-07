@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Reconcilia los usuarios de tunel SSH desde un tar recibido por stdin.
+
+Lo invoca servicio-init.sh con la accion 'tuneles'. Tambien corre por cron
+con --cron para purgar vencidos y corregir derivas desde la copia guardada
+en /var/lib/yaw/tuneles.yaml + /var/lib/yaw/tuneles-llaves/.
+
+El tar contiene:
+  - tuneles.yaml        config de usuarios (nombres, puertos, vencimientos)
+  - llaves/*.pub        claves PUBLICAS, un archivo por dispositivo
+
+De cada usuario del YAML:
+  - usuario del sistema en el grupo puyu-tunel, shell nologin, sin password;
+  - authorized_keys regenerado por completo con permitopen por puerto y
+    expiry-time nativo de OpenSSH (la llave deja de valer sola en la fecha);
+  - nada de shell ni TTY: solo forwarding a los destinos listados.
+
+Solo toca usuarios del grupo puyu-tunel CON su marcador de propiedad
+(/home/<usuario>/.puyu-tunel): nunca elimina, bloquea ni reescribe cuentas
+que no haya creado este runner. Un nombre del YAML que ya exista en el
+sistema sin el marcador hace fallar la aplicacion con error explicito.
+
+Esquema del tuneles.yaml:
+
+    puertos:                         # registro de destinos (nombre -> host:puerto)
+      grifos-dev-http: "127.0.0.1:6070"
+      grafana: "172.18.0.15:3000"
+
+    usuarios:
+      - nombre: juan
+        vencimiento: "2026-12-31"    # opcional; vacio = sin vencimiento
+        puertos:                     # nombres del registro anterior
+          - grifos-dev-http
+        llaves:                      # rutas a archivos en llaves/
+          - llaves/juan-laptop.pub
+"""
+import os, re, sys, syslog, subprocess, datetime, grp, shutil, tarfile
+import yaml
+
+GRUPO        = "puyu-tunel"
+MARCADOR     = ".puyu-tunel"
+COPIA_YAML   = "/var/lib/yaw/tuneles.yaml"
+COPIA_LLAVES = "/var/lib/yaw/tuneles-llaves"
+STAGING      = "/var/lib/yaw/tuneles-staging"
+DROP_IN      = "/etc/ssh/sshd_config.d/puyu-tuneles.conf"
+SSHD_CONF    = "/etc/ssh/sshd_config"
+CRON_RUTA    = "/etc/cron.d/puyu-tuneles"
+CRON_LINEA   = "23 45 * * * root /usr/local/bin/puyu-tuneles --cron\n"
+MAX_YAML     = 64 * 1024
+MAX_LLAVE    = 4 * 1024
+MAX_USUARIOS = 32
+MAX_PUERTOS  = 16
+MAX_LLAVES   = 8
+MAX_REGISTRO = 64
+IP           = (os.environ.get("SSH_CLIENT") or "local").split(" ")[0]
+
+NOMBRE_OK  = re.compile(r"^[a-z][a-z0-9-]{1,31}$")
+NOMBRE_PUERTO_OK = re.compile(r"^[a-z0-9][a-z0-9-]{1,31}$")
+PUERTO_OK  = re.compile(r"^[A-Za-z0-9.-]+:\d{2,5}$")
+LLAVE_RUTA = re.compile(r"^llaves/[A-Za-z0-9][A-Za-z0-9._-]*\.pub$")
+LLAVE_OK   = re.compile(
+    r"^(ssh-ed25519|ssh-rsa|ecdsa-sha2-\w+|sk-ssh-ed25519\S*)\s+"
+    r"[A-Za-z0-9+/]+={0,2}(\s+\S+)?$")
+
+
+def log(m):
+    """Registra en syslog con el tag puyu-tuneles."""
+    syslog.openlog("puyu-tuneles", syslog.LOG_PID)
+    syslog.syslog(f"ip={IP} {m}")
+
+
+def morir(m):
+    """Registra el error y termina con estado 1."""
+    log(f"RECHAZADO {m}")
+    print(f"ERROR: {m}", file=sys.stderr)
+    sys.exit(1)
+
+
+def aviso(m):
+    """Aviso no bloqueante por stderr."""
+    print(f"  aviso: {m}", file=sys.stderr)
+
+
+def cmd(*a):
+    """Ejecuta un comando del sistema con salida capturada."""
+    return subprocess.run(list(a), capture_output=True, text=True)
+
+
+def hoy():
+    """Fecha de hoy."""
+    return datetime.date.today()
+
+
+def recibir_tar():
+    """Extrae y valida el tar de stdin en STAGING; devuelve (yaml_crudo,
+    llaves) donde llaves es {ruta: contenido}."""
+    if os.path.exists(STAGING):
+        shutil.rmtree(STAGING)
+    os.makedirs(os.path.join(STAGING, "llaves"))
+
+    yaml_crudo = None
+    llaves = {}
+    vistos = set()
+    try:
+        with tarfile.open(fileobj=sys.stdin.buffer, mode="r|*") as tar:
+            for miembro in tar:
+                nombre = miembro.name
+                if nombre.startswith("./"):
+                    nombre = nombre[2:]
+                if miembro.isdir():
+                    continue
+                if nombre in ("llaves/.gitkeep",):
+                    continue
+                if miembro.issym() or miembro.islnk():
+                    morir(f"enlaces no permitidos: {nombre}")
+                if not miembro.isfile():
+                    morir(f"entrada no regular: {nombre}")
+                if nombre in vistos:
+                    morir(f"archivo duplicado en el tar: {nombre}")
+                vistos.add(nombre)
+
+                if nombre == "tuneles.yaml":
+                    if miembro.size > MAX_YAML:
+                        morir("tuneles.yaml excede 64 KB")
+                    yaml_crudo = tar.extractfile(miembro).read()
+                    continue
+                if LLAVE_RUTA.match(nombre):
+                    if miembro.size > MAX_LLAVE:
+                        morir(f"{nombre} excede 4 KB")
+                    texto = tar.extractfile(miembro).read() \
+                        .decode("utf-8", errors="replace").strip()
+                    if not LLAVE_OK.match(texto):
+                        morir(f"{nombre}: contenido invalido de llave publica")
+                    llaves[nombre] = texto
+                    continue
+                morir(f"archivo no permitido en el tar: {nombre!r}")
+    except tarfile.TarError as ex:
+        morir(f"el stdin no es un tar valido: {ex}")
+
+    if yaml_crudo is None:
+        morir("falta tuneles.yaml en el tar")
+    return yaml_crudo, llaves
+
+
+def validar_registro(datos):
+    """Valida el registro 'puertos' (nombre -> host:puerto) y devuelve el
+    mapa. Los usuarios referencian estos nombres, no destinos crudos."""
+    reg = datos.get("puertos")
+    if not isinstance(reg, dict):
+        morir("falta el mapa 'puertos' (nombre -> host:puerto) en el YAML")
+    if len(reg) > MAX_REGISTRO:
+        morir(f"maximo {MAX_REGISTRO} puertos en el registro")
+    salida = {}
+    for nombre, dest in reg.items():
+        if not isinstance(nombre, str) or not NOMBRE_PUERTO_OK.match(nombre):
+            morir(f"nombre de puerto invalido: {nombre!r}")
+        if not isinstance(dest, str) or not PUERTO_OK.match(dest):
+            morir(f"puerto {nombre}: destino invalido: {dest!r}")
+        try:
+            puerto_n = int(dest.split(":", 1)[1])
+        except ValueError:
+            morir(f"puerto {nombre}: destino invalido: {dest!r}")
+        if not (1 <= puerto_n <= 65535):
+            morir(f"puerto {nombre}: fuera de rango: {dest!r}")
+        salida[nombre] = dest
+    return salida
+
+
+def validar_yaml(crudo):
+    """Valida el YAML contra las reglas; devuelve la lista de usuarios
+    normalizada (rutas de llaves y fechas, sin contenido)."""
+    try:
+        datos = yaml.safe_load(crudo.decode("utf-8")) or {}
+    except yaml.YAMLError as ex:
+        morir(f"tuneles.yaml no es YAML valido: {ex}")
+    usuarios = datos.get("usuarios")
+    if not isinstance(usuarios, list):
+        morir("falta la lista 'usuarios' en el YAML")
+    if len(usuarios) > MAX_USUARIOS:
+        morir(f"maximo {MAX_USUARIOS} usuarios")
+
+    vistos = set()
+    salida = []
+    for u in usuarios:
+        if not isinstance(u, dict):
+            morir("cada usuario debe ser un mapa")
+        nombre = u.get("nombre")
+        if not isinstance(nombre, str) or not NOMBRE_OK.match(nombre):
+            morir(f"nombre de usuario invalido: {nombre!r}")
+        if nombre in vistos:
+            morir(f"usuario repetido: {nombre}")
+        vistos.add(nombre)
+
+        venc = u.get("vencimiento")
+        fecha = None
+        if venc:
+            if not isinstance(venc, str):
+                morir(f"{nombre}: vencimiento debe ser fecha YYYY-MM-DD")
+            try:
+                fecha = datetime.datetime.strptime(venc, "%Y-%m-%d").date()
+            except ValueError:
+                morir(f"{nombre}: vencimiento invalido: {venc!r}")
+
+        puertos = u.get("puertos") or []
+        if not isinstance(puertos, list) or len(puertos) > MAX_PUERTOS:
+            morir(f"{nombre}: 'puertos' debe ser lista de hasta "
+                  f"{MAX_PUERTOS} nombres del registro 'puertos'")
+        for p in puertos:
+            if not isinstance(p, str) or not NOMBRE_PUERTO_OK.match(p):
+                morir(f"{nombre}: puerto invalido (usar nombres del registro): "
+                      f"{p!r}")
+
+        llaves = u.get("llaves") or []
+        if not isinstance(llaves, list) or len(llaves) > MAX_LLAVES:
+            morir(f"{nombre}: 'llaves' debe ser lista de hasta {MAX_LLAVES} "
+                  f"rutas llaves/*.pub")
+        for k in llaves:
+            if not isinstance(k, str) or not LLAVE_RUTA.match(k):
+                morir(f"{nombre}: ruta de llave invalida: {k!r}")
+
+        salida.append({
+            "nombre": nombre,
+            "fecha": fecha,
+            "puertos": [p for p in puertos],
+            "rutas": [k for k in llaves],
+        })
+    return salida
+
+
+def resolver_puertos(usuarios, registro):
+    """Reemplaza los nombres de puertos de cada usuario por su destino del
+    registro."""
+    for u in usuarios:
+        resueltos = []
+        for nombre in u["puertos"]:
+            if nombre not in registro:
+                morir(f"{u['nombre']}: el puerto '{nombre}' no esta en el "
+                      f"registro 'puertos'")
+            resueltos.append(registro[nombre])
+        u["puertos"] = resueltos
+
+
+def resolver_llaves(usuarios, archivos):
+    """Reemplaza las rutas de llaves por su contenido validado y chequea
+    duplicados entre usuarios."""
+    claves_vistas = set()
+    referidas = set()
+    for u in usuarios:
+        contenidos = []
+        for ruta in u["rutas"]:
+            referidas.add(ruta)
+            if ruta not in archivos:
+                morir(f"{u['nombre']}: falta {ruta} en el tar")
+            cuerpo = archivos[ruta].split()[1]
+            if cuerpo in claves_vistas:
+                morir(f"llave duplicada entre usuarios: {ruta}")
+            claves_vistas.add(cuerpo)
+            contenidos.append(archivos[ruta])
+        u["llaves"] = contenidos
+    for ruta in sorted(set(archivos) - referidas):
+        aviso(f"{ruta}: llave no referenciada por ningun usuario")
+
+
+def vencido(u):
+    """True si el vencimiento ya paso (para purgar)."""
+    return u["fecha"] is not None and u["fecha"] < hoy()
+
+
+def expiry_time(fecha):
+    """Fecha en formato OpenSSH para expiry-time (YYYYMMDDHHMMSS)."""
+    return fecha.strftime("%Y%m%d") + "235959"
+
+
+def grupo_existe():
+    """True si el grupo puyu-tunel existe."""
+    try:
+        grp.getgrnam(GRUPO)
+        return True
+    except KeyError:
+        return False
+
+
+def miembros_grupo():
+    """Nombres de los miembros actuales del grupo puyu-tunel."""
+    try:
+        return list(grp.getgrnam(GRUPO).gr_mem)
+    except KeyError:
+        return []
+
+
+def asegurar_grupo():
+    """Crea el grupo puyu-tunel si falta."""
+    if grupo_existe():
+        return
+    r = cmd("groupadd", GRUPO)
+    if r.returncode != 0:
+        morir(f"no se pudo crear el grupo {GRUPO}: {r.stderr.strip()[:200]}")
+
+
+def usuario_existe(nombre):
+    """True si el usuario del sistema existe."""
+    return cmd("id", nombre).returncode == 0
+
+
+def marcado(nombre):
+    """True si el usuario fue creado por este runner (tiene el marcador)."""
+    return os.path.isfile(f"/home/{nombre}/{MARCADOR}")
+
+
+def escribir_autorizado(nombre, lineas):
+    """Escribe authorized_keys atomico con dueño y permisos correctos."""
+    sshdir = f"/home/{nombre}/.ssh"
+    ruta = os.path.join(sshdir, "authorized_keys")
+    r = cmd("install", "-d", "-m", "700", "-o", nombre, "-g", GRUPO, sshdir)
+    if r.returncode != 0:
+        morir(f"no se pudo preparar {sshdir}: {r.stderr.strip()[:200]}")
+    tmp = f"{ruta}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for l in lineas:
+            f.write(l + "\n")
+    os.chmod(tmp, 0o600)
+    r = cmd("chown", f"{nombre}:{GRUPO}", tmp)
+    if r.returncode == 0:
+        os.replace(tmp, ruta)
+    else:
+        os.remove(tmp)
+        morir(f"no se pudo asignar {ruta}: {r.stderr.strip()[:200]}")
+
+
+def desplegar_usuario(u, cambios):
+    """Crea o actualiza el usuario del sistema y su authorized_keys. Nunca
+    toca cuentas que no sean suyas (marcador de propiedad)."""
+    nombre = u["nombre"]
+    if not usuario_existe(nombre):
+        r = cmd("useradd", "-m", "-s", "/usr/sbin/nologin",
+                "-g", GRUPO, nombre)
+        if r.returncode != 0:
+            morir(f"useradd {nombre} fallo: {r.stderr.strip()[:200]}")
+        marca = f"/home/{nombre}/{MARCADOR}"
+        with open(marca, "w", encoding="utf-8") as f:
+            f.write("gestionado por puyu-tuneles\n")
+        os.chmod(marca, 0o600)
+        cambios.append(f"{nombre}: usuario creado (grupo {GRUPO}, nologin)")
+    elif not marcado(nombre):
+        morir(f"el usuario {nombre} ya existe en el sistema y no fue creado "
+              f"por puyu-tuneles; no lo voy a tocar. Usa otro nombre en el "
+              f"YAML o gestiona ese usuario a mano.")
+    cmd("usermod", "-g", GRUPO, nombre)
+    cmd("passwd", "-l", nombre)
+
+    lineas = []
+    for k in u["llaves"]:
+        opts = ["no-pty", "no-agent-forwarding", "no-X11-forwarding"]
+        if u["fecha"]:
+            opts.append(f'expiry-time="{expiry_time(u["fecha"])}"')
+        for p in u["puertos"]:
+            opts.append(f'permitopen="{p}"')
+        lineas.append(f"{','.join(opts)} {k}")
+    escribir_autorizado(nombre, lineas)
+    cambios.append(f"{nombre}: {len(lineas)} llave(s), "
+                   f"{len(u['puertos'])} puerto(s)")
+
+
+def purgar_extra(activos, cambios):
+    """Elimina usuarios del grupo que ya no estan en el YAML activo. Solo
+    los que tienen el marcador de propiedad: los demas se saltan."""
+    for m in miembros_grupo():
+        if m in activos:
+            continue
+        if not marcado(m):
+            aviso(f"{m}: miembro del grupo {GRUPO} sin marcador; "
+                  f"no lo elimino")
+            continue
+        r = cmd("userdel", "-r", m)
+        if r.returncode == 0:
+            cambios.append(f"{m}: usuario eliminado (ya no esta en el YAML)")
+        else:
+            aviso(f"no se pudo eliminar {m}: {r.stderr.strip()[:200]}")
+
+
+def desplegar_drop_in():
+    """Escribe el Match Group de sshd y recarga si cambio algo."""
+    contenido = (
+        "# Gestionado por puyu-tuneles. No editar a mano.\n"
+        f"Match Group {GRUPO}\n"
+        "    PasswordAuthentication no\n"
+        "    KbdInteractiveAuthentication no\n"
+        "    AllowTcpForwarding yes\n"
+        "    PermitTTY no\n"
+        "    X11Forwarding no\n"
+        "    AllowAgentForwarding no\n")
+
+    actual = ""
+    if os.path.isfile(DROP_IN):
+        with open(DROP_IN, encoding="utf-8") as f:
+            actual = f.read()
+    if actual == contenido:
+        return False
+
+    backup = DROP_IN + ".bak"
+    if os.path.isfile(DROP_IN):
+        shutil.copy2(DROP_IN, backup)
+    with open(DROP_IN, "w", encoding="utf-8") as f:
+        f.write(contenido)
+
+    r = cmd("sshd", "-t")
+    if r.returncode != 0:
+        if os.path.isfile(backup):
+            shutil.copy2(backup, DROP_IN)
+        morir("sshd -t fallo tras escribir el drop-in; se restauro "
+              "el anterior:\n" + (r.stderr or "")[:800])
+    cmd("systemctl", "reload", "ssh")
+    return True
+
+
+def asegurar_include():
+    """Garantiza que sshd_config incluya sshd_config.d (Ubuntu moderno)."""
+    with open(SSHD_CONF, encoding="utf-8", errors="replace") as f:
+        texto = f.read()
+    if "sshd_config.d" in texto:
+        return False
+    with open(SSHD_CONF, "a", encoding="utf-8") as f:
+        f.write("\n# puyu: drop-ins gestionados por puyu-tuneles\n"
+                "Include /etc/ssh/sshd_config.d/*.conf\n")
+    r = cmd("sshd", "-t")
+    if r.returncode != 0:
+        morir("sshd -t fallo tras agregar el Include:\n" +
+              (r.stderr or "")[:800])
+    cmd("systemctl", "reload", "ssh")
+    return True
+
+
+def asegurar_cron():
+    """Instala el cron diario de purga si falta o cambio."""
+    if os.path.isfile(CRON_RUTA):
+        with open(CRON_RUTA, encoding="utf-8") as f:
+            if f.read() == CRON_LINEA:
+                return False
+    with open(CRON_RUTA, "w", encoding="utf-8") as f:
+        f.write(CRON_LINEA)
+    os.chmod(CRON_RUTA, 0o644)
+    return True
+
+
+def ejecutar(crudo, archivos):
+    """Valida YAML y llaves; reconcilia usuarios, authorized_keys, sshd y
+    cron."""
+    registro = validar_registro(yaml.safe_load(crudo.decode("utf-8")) or {})
+    usuarios = validar_yaml(crudo)
+    resolver_puertos(usuarios, registro)
+    resolver_llaves(usuarios, archivos)
+
+    asegurar_grupo()
+    asegurar_include()
+    cambios = []
+
+    activos = {}
+    for u in usuarios:
+        if vencido(u):
+            cambios.append(f"{u['nombre']}: vencido ({u['fecha']}); "
+                           f"no se aprovisiona")
+            continue
+        desplegar_usuario(u, cambios)
+        activos[u["nombre"]] = True
+
+    purgar_extra(activos, cambios)
+
+    if desplegar_drop_in():
+        cambios.append("sshd: drop-in aplicado y recargado")
+    if asegurar_cron():
+        cambios.append("cron diario instalado")
+
+    for c in cambios:
+        print(f"  {c}")
+    print(f"OK tuneles: {len(activos)} usuario(s) activo(s), "
+          f"{len(usuarios) - len(activos)} vencido(s)/omitido(s)")
+    log(f"OK activos={len(activos)} cambios={len(cambios)}")
+
+
+def guardar_copia(crudo, archivos):
+    """Guarda el YAML y las llaves para el modo --cron."""
+    with open(COPIA_YAML, "wb") as f:
+        f.write(crudo)
+    os.chmod(COPIA_YAML, 0o600)
+    if os.path.exists(COPIA_LLAVES):
+        shutil.rmtree(COPIA_LLAVES)
+    os.makedirs(COPIA_LLAVES, mode=0o700)
+    for ruta, contenido in archivos.items():
+        destino = os.path.join(COPIA_LLAVES, os.path.basename(ruta))
+        with open(destino, "w", encoding="utf-8") as f:
+            f.write(contenido + "\n")
+        os.chmod(destino, 0o600)
+
+
+def cargar_copia():
+    """Lee la copia guardada (YAML + llaves) como si viniera del tar."""
+    if not os.path.isfile(COPIA_YAML):
+        return None, {}
+    with open(COPIA_YAML, "rb") as f:
+        crudo = f.read()
+    archivos = {}
+    if os.path.isdir(COPIA_LLAVES):
+        for nombre in sorted(os.listdir(COPIA_LLAVES)):
+            ruta = f"llaves/{nombre}"
+            if not LLAVE_RUTA.match(ruta):
+                continue
+            with open(os.path.join(COPIA_LLAVES, nombre),
+                      encoding="utf-8") as f:
+                archivos[ruta] = f.read().strip()
+    return crudo, archivos
+
+
+def main():
+    """Punto de entrada: modo normal (tar por stdin) o --cron (copia)."""
+    os.umask(0o077)
+    if len(sys.argv) == 2 and sys.argv[1] == "--cron":
+        crudo, archivos = cargar_copia()
+        if crudo is None:
+            log("--cron sin copia aplicada: nada que hacer")
+            return
+        print("puyu-tuneles --cron: re-aplicando desde la copia guardada")
+        ejecutar(crudo, archivos)
+        return
+    if sys.argv[1:]:
+        morir("uso: puyu-tuneles [--cron]  (el tar llega por stdin)")
+
+    crudo, archivos = recibir_tar()
+    ejecutar(crudo, archivos)
+    guardar_copia(crudo, archivos)
+
+
+if __name__ == "__main__":
+    main()

@@ -10,16 +10,16 @@
 #   Defaults:jenkins env_keep += "SSH_CLIENT SSH_CONNECTION SSH_ORIGINAL_COMMAND"
 #   jenkins ALL=(root) NOPASSWD: /usr/local/bin/servicio-init.sh
 #
-# Acciones validas: menu | rutas | nginx | imagen <servicio> <dev|prod>
+# Acciones validas: menu | rutas | nginx | tuneles | imagen <servicio> <dev|prod>
 # [clave=valor ...] | estado | registro | revertir. Aqui solo se valida la
 # FORMA del comando; los pares clave=valor los valida puyu-deploy contra su
 # lista blanca.
 
 set -uo pipefail
 
-REPO_URL="https://github.com/Labotec-Peru/puyu-infra-runners.git"
-REPO_DIR="/var/lib/puyu/runners"
-CACHE="/var/lib/puyu/servicios.yaml"
+REPO_URL="https://github.com/Labotec-Peru/yaw-infra-runners.git"
+REPO_DIR="/var/lib/yaw/runners"
+CACHE="/var/lib/yaw/servicios.yaml"
 BIN="/usr/local/bin"
 IP="${SSH_CLIENT%% *}"
 
@@ -30,14 +30,14 @@ morir(){ log "RECHAZADO $*"; echo "ERROR: $*" >&2; exit 1; }
 # puyu-git-askpass: nunca viaja en la linea de comandos) y reinstala los
 # binarios con verificacion de sintaxis.
 actualizar_bins() {
-  install -d -m 700 /var/lib/puyu
+  install -d -m 700 /var/lib/yaw
 
   export GIT_ASKPASS="$BIN/puyu-git-askpass"
   export GIT_TERMINAL_PROMPT=0
 
   if [ ! -d "$REPO_DIR/.git" ]; then
     git clone --quiet "$REPO_URL" "$REPO_DIR" \
-      || morir "no se pudo clonar el repo (revisa /etc/puyu/github-app.conf)"
+      || morir "no se pudo clonar el repo (revisa /etc/yaw/github-app.conf)"
   else
     git -C "$REPO_DIR" fetch --quiet --tags origin \
       || morir "no se pudo actualizar el repo"
@@ -48,7 +48,7 @@ actualizar_bins() {
 
   local commit; commit=$(git -C "$REPO_DIR" rev-parse --short HEAD)
 
-  for f in puyu-alta puyu-deploy puyu-revisar puyu-token puyu-nginx; do
+  for f in puyu-alta puyu-deploy puyu-revisar puyu-token puyu-nginx puyu-tuneles; do
     [ -f "$REPO_DIR/bin/$f" ] || morir "falta bin/$f en el repo"
     python3 -m py_compile "$REPO_DIR/bin/$f" || morir "bin/$f no compila"
     install -m 755 -o root -g root "$REPO_DIR/bin/$f" "$BIN/$f"
@@ -99,6 +99,11 @@ case "$ACCION" in
     "$BIN/puyu-nginx"
     ;;
 
+  tuneles)
+    actualizar_bins
+    "$BIN/puyu-tuneles"
+    ;;
+
   imagen)
     [ -n "${SERVICIO:-}" ] && [ -n "${ENTORNO:-}" ] \
       || morir "uso: imagen <servicio> <dev|prod> [clave=valor ...]"
@@ -120,6 +125,7 @@ case "$ACCION" in
   menu)
     echo "rutas                                     aplica servicios.yaml (por stdin)"
     echo "nginx                                     valida y aplica la config de nginx (tar por stdin)"
+    echo "tuneles                                   aplica usuarios de tunel SSH (YAML por stdin)"
     echo "imagen   <servicio> <entorno> [k=v ...]   despliega una imagen (tar por stdin)"
     echo "estado   <servicio> <entorno>             estado del contenedor"
     echo "registro <servicio> <entorno>             ultimas 50 lineas de log"

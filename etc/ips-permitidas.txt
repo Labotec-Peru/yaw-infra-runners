@@ -1,6 +1,6 @@
 # IPs y rangos autorizados para aparecer escritos en el codigo de una imagen.
 #
-# Copiar a /etc/puyu/ips-permitidas.txt en el servidor.
+# Copiar a /etc/yaw/ips-permitidas.txt en el servidor.
 #
 #   el archivo NO existe  ->  modo permisivo: las IPs publicas solo se reportan
 #   el archivo SI existe  ->  modo ESTRICTO: una IP publica que no este aqui y
@@ -21,7 +21,7 @@
 # la pegues: averigualo primero.
 
 # ── infraestructura propia ───────────────────────────────────────────────────
-5.189.180.249        # vmi3116730 - servicios, nginx, kong
+173.249.36.100        # vmi2865762 - servicios, nginx, kong
 85.208.51.199        # vmi3119248 - jenkins
 
 # ── integraciones con IP fija ────────────────────────────────────────────────

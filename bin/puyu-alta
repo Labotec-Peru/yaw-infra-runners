@@ -4,14 +4,14 @@ que falta, corrige lo que difiere y NO borra nada. Crea los .env declarados
 y registra servicios, rutas y plugins en Kong.
 
 Lo invoca servicio-init.sh con la accion 'rutas'. El YAML se valida completo
-ANTES de aplicar nada: nombres, rutas .env, puertos, hosts bajo .puyu-iot.com
+ANTES de aplicar nada: nombres, rutas .env, puertos, hosts bajo .yaw-iot.com
 y plugins en lista blanca.
 """
 import os, re, sys, json, hashlib, syslog, urllib.request, urllib.error, yaml
 
 ADMIN      = os.environ.get("KONG_ADMIN", "http://127.0.0.1:8001")
-HOSTS      = {"prod": "apisprod.puyu-iot.com", "dev": "apisdev.puyu-iot.com"}
-DOMINIO    = ".puyu-iot.com"
+HOSTS      = {"prod": "apisprod.yaw-iot.com", "dev": "apisdev.yaw-iot.com"}
+DOMINIO    = ".yaw-iot.com"
 PLUGINS_OK = {"rate-limiting", "cors", "key-auth", "ip-restriction",
               "request-size-limiting", "bot-detection"}
 MAX_YAML   = 256 * 1024

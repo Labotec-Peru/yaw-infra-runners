@@ -14,13 +14,13 @@ clases Java, dependencias envenenadas que se vean normales, ni nada que el
 atacante escriba en tiempo de ejecucion.
 
 Los falsos positivos se ajustan SIN tocar el codigo en
-/etc/puyu/ioc-exentos.txt (ruta | patron [| fragmento]).
+/etc/yaw/ioc-exentos.txt (ruta | patron [| fragmento]).
 """
 import io, os, re, sys, json, stat, tarfile, tempfile, zipfile, syslog, ipaddress
 
 MAX_TEXTO    = 4 * 1024**2
 MAX_TOTAL    = 3 * 1024**3
-PERMITIDAS   = "/etc/puyu/ips-permitidas.txt"
+PERMITIDAS   = "/etc/yaw/ips-permitidas.txt"
 
 DIRS_ELF_OK = (
     "bin/", "sbin/", "lib/", "lib64/", "libexec/",
@@ -86,7 +86,7 @@ IOC = [
      "manipulacion de cron"),
 ]
 
-IOC_EXENTOS_F = "/etc/puyu/ioc-exentos.txt"
+IOC_EXENTOS_F = "/etc/yaw/ioc-exentos.txt"
 IOC_EXENTOS_DEFAULT = {
     "etc/busybox-paths.d/busybox": {"tecnica de persistencia u ocultamiento": []},
     "etc/passwd":  {"manipulacion de cron": []},

@@ -5,7 +5,7 @@ tar(.gz). Lo invoca servicio-init.sh con la accion 'nginx'.
 Flujo:
   1. Recibe y valida el tar (solo nginx.conf, renovar_certificados.sh y
      conf.d/*.conf; sin rutas absolutas, '..' ni enlaces; tamanos acotados).
-  2. Valida server_name (bajo .puyu-iot.com, duplicados http/https como aviso)
+  2. Valida server_name (bajo .yaw-iot.com, duplicados http/https como aviso)
      y backends (nombre valido de contenedor).
   3. Verifica que cada backend http://NOMBRE:80 apunte a un contenedor que
      exista. Un nombre casi identico (segmentos permutados o diferencia
@@ -28,8 +28,8 @@ RENOVAR      = os.path.join(NGINX_DIR, "renovar_certificados.sh")
 CERTS_HOST   = os.path.join(NGINX_DIR, "certs")
 CERTBOT_HOST = "/var/www/certbot"
 IMAGEN_NGINX = "nginx:1.27"
-STAGING      = "/var/lib/puyu/nginx-staging"
-BACKUP       = "/var/lib/puyu/nginx-backup"
+STAGING      = "/var/lib/yaw/nginx-staging"
+BACKUP       = "/var/lib/yaw/nginx-backup"
 MAX_FILE     = 64 * 1024
 MAX_TAR      = 2 * 1024**2
 EMAIL_CERTBOT = "labotecperupuyu@gmail.com"
@@ -72,8 +72,8 @@ def revisar_conf(nombre, datos, dominios, backends):
         for d in m.group(1).split():
             if d == "_":
                 continue
-            if not d.endswith(".puyu-iot.com") or \
-               not DOMINIO_OK.match(d[:-len(".puyu-iot.com")]):
+            if not d.endswith(".yaw-iot.com") or \
+               not DOMINIO_OK.match(d[:-len(".yaw-iot.com")]):
                 morir(f"{nombre}: server_name invalido: {d!r}")
             if d in dominios:
                 aviso(f"server_name repetido: {d} "

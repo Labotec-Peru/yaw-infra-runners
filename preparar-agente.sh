@@ -1,7 +1,7 @@
 #!/bin/bash
 # Corre en la MAQUINA DE JENKINS (root): prepara el contenedor de Jenkins para
-# el job de puyu-routes: python3+yaml (validacion del YAML), openssh-client
-# (ssh al servidor) y el host key de 5.189.180.249 en known_hosts del usuario
+# el job de yaw-routes: python3+yaml (validacion del YAML), openssh-client
+# (ssh al servidor) y el host key de 173.249.36.100 en known_hosts del usuario
 # jenkins (el job usa StrictHostKeyChecking=yes).
 #
 # Uso local (PowerShell):
@@ -27,14 +27,14 @@ else
   exit 1
 fi
 
-ssh-keyscan 5.189.180.249 > /tmp/puyu-keyscan
+ssh-keyscan 173.249.36.100 > /tmp/yaw-keyscan
 docker exec -u root "$CONT" mkdir -p /var/jenkins_home/.ssh
-docker cp /tmp/puyu-keyscan "$CONT":/var/jenkins_home/.ssh/known_hosts
+docker cp /tmp/yaw-keyscan "$CONT":/var/jenkins_home/.ssh/known_hosts
 docker exec -u root "$CONT" chown -R jenkins:jenkins /var/jenkins_home/.ssh
-rm -f /tmp/puyu-keyscan
+rm -f /tmp/yaw-keyscan
 
 echo "--- python3 en el agente:"
 docker exec "$CONT" python3 --version || true
-echo "--- host key del servidor puyu (debe aparecer 5.189.180.249):"
-docker exec "$CONT" ssh-keygen -F 5.189.180.249 || true
+echo "--- host key del servidor yaw (debe aparecer 173.249.36.100):"
+docker exec "$CONT" ssh-keygen -F 173.249.36.100 || true
 echo "--- listo"
