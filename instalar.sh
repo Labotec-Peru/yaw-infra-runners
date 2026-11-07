@@ -3,13 +3,13 @@
 set -euo pipefail
 DESTINO="${1:?uso: ./instalar.sh <usuario@host>}"
 
-python3 -m py_compile bin/yaw-alta bin/yaw-deploy bin/yaw-revisar bin/yaw-token bin/yaw-nginx
+python3 -m py_compile bin/yaw-alta bin/yaw-deploy bin/yaw-revisar bin/yaw-token bin/yaw-nginx bin/yaw-tuneles
 bash -n bin/servicio-init.sh
 sh -n bin/yaw-git-askpass
 echo "--- sintaxis OK"
 
 scp -O bin/yaw-alta bin/yaw-deploy bin/yaw-revisar bin/yaw-token \
-  bin/yaw-nginx bin/yaw-git-askpass bin/servicio-init.sh "$DESTINO":/tmp/
+  bin/yaw-nginx bin/yaw-tuneles bin/yaw-git-askpass bin/servicio-init.sh "$DESTINO":/tmp/
 
 ssh "$DESTINO" '
   set -e
@@ -24,12 +24,12 @@ ssh "$DESTINO" '
   }
   install -d -m 700 -o jenkins -g jenkins /home/jenkins/.ssh
 
-  for f in yaw-alta yaw-deploy yaw-revisar yaw-token yaw-nginx yaw-git-askpass servicio-init.sh; do
+  for f in yaw-alta yaw-deploy yaw-revisar yaw-token yaw-nginx yaw-tuneles yaw-git-askpass servicio-init.sh; do
     install -m 755 -o root -g root "/tmp/$f" "/usr/local/bin/$f"
     rm -f "/tmp/$f"
   done
   python3 -m py_compile /usr/local/bin/yaw-alta /usr/local/bin/yaw-deploy \
-    /usr/local/bin/yaw-revisar /usr/local/bin/yaw-token /usr/local/bin/yaw-nginx
+    /usr/local/bin/yaw-revisar /usr/local/bin/yaw-token /usr/local/bin/yaw-nginx /usr/local/bin/yaw-tuneles
 
   cat > /etc/sudoers.d/jenkins-alta <<SUDO
 Defaults:jenkins env_keep += "SSH_CLIENT SSH_CONNECTION SSH_ORIGINAL_COMMAND"
