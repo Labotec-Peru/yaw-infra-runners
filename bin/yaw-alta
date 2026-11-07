@@ -90,6 +90,9 @@ def validar(svc):
             pth = e.get("path")
             if pth and not re.fullmatch(r"/[A-Za-z0-9._/-]{0,96}", pth):
                 morir(f"[{n}/{ent}] path de servicio invalido: {pth!r}")
+            hst = e.get("host")
+            if hst and not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,48}", hst):
+                morir(f"[{n}/{ent}] host de servicio invalido: {hst!r}")
             h = e.get("kong_host") or HOSTS[ent]
             if not isinstance(h, str) or not h.endswith(DOMINIO):
                 morir(f"[{n}/{ent}] host fuera del dominio propio: {h!r}")
@@ -134,14 +137,15 @@ def kong(svc, ent, e):
     host     = e.get("kong_host") or HOSTS[ent]
     strip    = bool(svc.get("strip_path", True))
 
+    host_svc = e.get("host") or nombre_k
     st, actual = api("GET", f"/services/{nombre_k}")
     nuevo   = (st == 404)
-    difiere = st == 200 and (actual.get("host") != nombre_k
+    difiere = st == 200 and (actual.get("host") != host_svc
                              or actual.get("port") != e["http"]
                              or (actual.get("path") or "") != (e.get("path") or ""))
 
     st, _ = api("PUT", f"/services/{nombre_k}", {
-        "name": nombre_k, "host": nombre_k, "port": e["http"], "protocol": "http",
+        "name": nombre_k, "host": host_svc, "port": e["http"], "protocol": "http",
         "path": e.get("path"),
         "connect_timeout": 10000, "read_timeout": 60000, "write_timeout": 60000})
     if st not in (200, 201):
