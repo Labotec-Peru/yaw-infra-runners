@@ -61,6 +61,7 @@ REGLAS = {
     "java_opts":  r"[-A-Za-z0-9=:.,%+]{1,256}",
     "salud":      r"/[A-Za-z0-9._/-]{0,96}",
     "reintentos": r"\d{1,3}",
+    "replicas":   r"[1-4]",
     "conservar":  r"\d{1,2}",
 }
 PROHIBIDOS = ("nombre", "entorno", "uid", "red", "network", "imagen",
@@ -130,6 +131,7 @@ def parsear(args):
     cfg["java_opts"]  = p.get("java_opts", "")
     cfg["reintentos"] = int(p.get("reintentos", 45))
     cfg["conservar"]  = int(p.get("conservar", 3))
+    cfg["replicas"]   = int(p.get("replicas", 1))
 
     if float(cfg["cpus"]) > TOPES["cpus"]:
         morir(f"cpus fuera de rango: {cfg['cpus']} (tope {TOPES['cpus']})")
@@ -137,6 +139,8 @@ def parsear(args):
         morir(f"pids fuera de rango: {cfg['pids']} (tope {TOPES['pids']})")
     if not (1 <= cfg["reintentos"] <= 120):
         morir(f"reintentos fuera de rango: {cfg['reintentos']}")
+    if not (1 <= cfg["replicas"] <= 4):
+        morir(f"replicas fuera de rango: {cfg['replicas']} (tope 4)")
 
     if tipo == "back":
         if "puertos" not in p:
@@ -317,9 +321,10 @@ def recibir_tar():
     return ruta, tag, sha
 
 
-def arrancar(cfg, cont, tag):
+def arrancar(cfg, cont, tag, publicar=True):
     """Construye el docker run con los flags fijos de seguridad: back con
-    puertos SIEMPRE en 127.0.0.1, --user, --read-only y /tmp tmpfs con exec
+    puertos SIEMPRE en 127.0.0.1 (replica 1; las replicas 2..N no publican),
+    --user, --read-only y /tmp tmpfs con exec
     (los JVM extraen ahi sus librerias nativas); front sin puertos y con
     capacidades/tmpfs que nginx necesita para bajar privilegios."""
     cmd = ["run", "-d", "--name", cont,
@@ -338,8 +343,9 @@ def arrancar(cfg, cont, tag):
         cmd += ["--env-file", cfg["env"]]
 
     if cfg["tipo"] == "back":
-        for host_p, cont_p in cfg["puertos"]:
-            cmd += ["-p", f"127.0.0.1:{host_p}:{cont_p}"]
+        if publicar:
+            for host_p, cont_p in cfg["puertos"]:
+                cmd += ["-p", f"127.0.0.1:{host_p}:{cont_p}"]
         cmd += ["--user", cfg["uid"],
                 "--read-only",
                 "--tmpfs", "/tmp:rw,exec,nosuid,size=256m"]
@@ -355,20 +361,24 @@ def arrancar(cfg, cont, tag):
     return docker(*cmd)
 
 
-def destino(cfg, cont):
-    """Punto de health check: back -> 127.0.0.1:primer puerto; front ->
-    IP del contenedor en la red:80."""
+def destino(cfg, cont, publicado=True):
+    """Punto de health check: back -> 127.0.0.1:primer puerto publicado, o
+    IP del contenedor en la red con su puerto interno (replicas sin puertos
+    publicados); front -> IP del contenedor en la red:80."""
     if cfg["tipo"] == "back":
-        return "127.0.0.1", int(cfg["puertos"][0][0])
+        if publicado:
+            return "127.0.0.1", int(cfg["puertos"][0][0])
+        ip = ip_home_net(cont)
+        return (ip, int(cfg["puertos"][0][1])) if ip else (None, None)
     r = docker("inspect", "-f",
                '{{(index .NetworkSettings.Networks "' + RED + '").IPAddress}}', cont)
     ip = (r.stdout or "").strip()
     return (ip, 80) if ip else (None, None)
 
 
-def sano(cfg, cont):
+def sano(cfg, cont, publicado=True):
     """Health check: puerto escuchando y, si hay salud, HTTP 2xx sin DOWN."""
-    host, puerto = destino(cfg, cont)
+    host, puerto = destino(cfg, cont, publicado)
     if not host:
         return False
     try:
@@ -388,7 +398,7 @@ def sano(cfg, cont):
         return False
 
 
-def esperar(cfg, cont, intentos=None):
+def esperar(cfg, cont, publicado=True, intentos=None):
     """Espera hasta que el contenedor este sano (o muera)."""
     intentos = intentos or cfg["reintentos"]
     print(f"health check: {cont} (max {intentos} x 2s)")
@@ -396,7 +406,7 @@ def esperar(cfg, cont, intentos=None):
         if docker("inspect", "-f", "{{.State.Status}}", cont).stdout.strip() != "running":
             print(f"  !! {cont} dejo de correr en el intento {i + 1}")
             return False
-        if sano(cfg, cont):
+        if sano(cfg, cont, publicado):
             print(f"  OK en el intento {i + 1}")
             return True
         time.sleep(2)
@@ -453,7 +463,7 @@ def purgar(base, tag_actual, conservar):
         docker("rmi", f"{base}:{t}")
 
 
-def rollback(cfg, cont, viejo):
+def rollback(cfg, cont, viejo, publicado=True):
     """Restaura el contenedor _old y valida que responda."""
     print("!! ── ROLLBACK ──", file=sys.stderr)
     docker("stop", "-t", "10", cont)
@@ -465,13 +475,77 @@ def rollback(cfg, cont, viejo):
         return
     docker("rename", viejo, cont)
     docker("start", cont)
-    if esperar(cfg, cont, intentos=45):
+    if esperar(cfg, cont, publicado, intentos=45):
         log(f"ROLLBACK OK {cont}")
         print("!! rollback OK: la version anterior esta viva y responde",
               file=sys.stderr)
     else:
         log(f"ROLLBACK FALLIDO {cont}")
         print("!! ROLLBACK FALLIDO: el servicio puede estar caido", file=sys.stderr)
+
+
+def nombres_replicas(cont, n):
+    """Nombres de contenedores: cont (replica 1) y cont-2..cont-N."""
+    return [cont] + [f"{cont}-{i}" for i in range(2, n + 1)]
+
+
+def desplegar_una(cfg, cont, tag, base, publicar):
+    """Despliega UNA replica con el renombrado atomico; True si quedo sana."""
+    viejo = f"{cont}_old"
+    if existe(viejo):
+        if existe(cont):
+            print(f"aviso: {viejo} huerfano de un deploy anterior; lo elimino")
+            docker("rm", "-f", viejo)
+        else:
+            print(f"aviso: deploy anterior interrumpido. {viejo} es la ultima "
+                  f"version buena: la restauro antes de seguir")
+            docker("rename", viejo, cont)
+            docker("start", cont)
+
+    if existe(cont):
+        docker("stop", "-t", "20", cont)
+        docker("rename", cont, viejo)
+    else:
+        print(f"no hay contenedor previo: despliegue inicial ({cont})")
+
+    r = arrancar(cfg, cont, tag, publicar)
+    if r.returncode:
+        print(f"docker run fallo: {r.stderr.strip()[:300]}", file=sys.stderr)
+        rollback(cfg, cont, viejo, publicar)
+        return False
+
+    if not esperar(cfg, cont, publicar):
+        print("!! health check fallo", file=sys.stderr)
+        print("── ultimas 150 lineas ──", file=sys.stderr)
+        lg = docker("logs", "--tail", "150", cont)
+        print((lg.stdout or "")[-6000:], file=sys.stderr)
+        print((lg.stderr or "")[-6000:], file=sys.stderr)
+        if not existe(viejo):
+            log(f"SIN HEALTH PERO VIVO {cont}: primer despliegue sin version "
+                f"anterior; el contenedor queda corriendo")
+            print("!! primer despliegue sin version anterior: el contenedor "
+                  "queda corriendo para inspeccion. Usa 'estado' y 'registro' "
+                  "para ver si termino de arrancar.", file=sys.stderr)
+            return False
+        rollback(cfg, cont, viejo, publicar)
+        return False
+
+    if cfg["tipo"] == "front" and not asegurar_dns(cfg, cont):
+        if existe(viejo):
+            print("!! nombre sin resolver tras el deploy; restaurando la "
+                  "version anterior", file=sys.stderr)
+            rollback(cfg, cont, viejo, publicar)
+        else:
+            log(f"SIN DNS {cont}: el contenedor quedo corriendo")
+            print(f"!! {cont} esta sano por IP pero su nombre no resuelve "
+                  f"en {RED}: nginx responderia 502. Reintenta el deploy.",
+                  file=sys.stderr)
+        return False
+
+    if existe(viejo):
+        docker("rm", "-f", viejo)
+    guardar_cfg(cont, cfg)
+    return True
 
 
 def main():
@@ -494,17 +568,24 @@ def main():
     viejo = f"{cont}_old"
 
     if accion == "estado":
-        r = docker("inspect", "-f",
-                   "{{.Name}} estado={{.State.Status}} reinicios={{.RestartCount}} "
-                   "imagen={{.Config.Image}} desde={{.State.StartedAt}}", cont)
-        if r.returncode:
-            morir(f"no existe el contenedor {cont}")
-        print(r.stdout.strip())
+        nombres = [n for n in nombres_replicas(cont, 4) if existe(n)]
+        if not nombres:
+            morir(f"no existe el contenedor {cont} (ni replicas)")
+        for n in nombres:
+            r = docker("inspect", "-f",
+                       "{{.Name}} estado={{.State.Status}} reinicios={{.RestartCount}} "
+                       "imagen={{.Config.Image}} desde={{.State.StartedAt}}", n)
+            print(r.stdout.strip())
         return
 
     if accion == "registro":
-        r = docker("logs", "--tail", "50", cont)
-        print(r.stdout or r.stderr)
+        nombres = [n for n in nombres_replicas(cont, 4) if existe(n)]
+        if not nombres:
+            morir(f"no existe el contenedor {cont} (ni replicas)")
+        for n in nombres:
+            r = docker("logs", "--tail", "50", n)
+            print(f"── {n} ──")
+            print(r.stdout or r.stderr)
         return
 
     lock = open(LOCK, "w")
@@ -527,92 +608,78 @@ def main():
     if cfg.get("env"):
         validar_env(cfg["env"])
 
-    if existe(viejo):
-        if existe(cont):
-            print(f"aviso: {viejo} huerfano de un deploy anterior; lo elimino")
-            docker("rm", "-f", viejo)
-        else:
-            print(f"aviso: deploy anterior interrumpido. {viejo} es la ultima "
-                  f"version buena: la restauro antes de seguir")
-            docker("rename", viejo, cont)
-            docker("start", cont)
-
-    ruta = None
-    if accion == "revertir":
-        actual = docker("inspect", "-f", "{{.Config.Image}}", cont).stdout.strip()
-        if not actual:
-            morir(f"no existe el contenedor {cont}")
-        base, tag, sha = actual.split(":")[0], f"{actual.split(':')[0]}:previo", "-"
-        if docker("image", "inspect", tag).returncode:
-            morir(f"no hay imagen previa guardada ({tag})")
-    else:
+    if accion == "desplegar":
+        n_replicas = cfg.get("replicas", 1)
         ruta, tag, sha = recibir_tar()
         base = tag.split(":")[0]
         revisar_imagen(ruta, cfg["tipo"])
 
-    if accion == "desplegar":
-        vivo = docker("inspect", "-f", "{{.Image}}", cont).stdout.strip()
-        if vivo:
-            docker("tag", vivo, f"{base}:previo")
+        # La imagen viva de cada replica queda como :previo antes del load.
+        for n in nombres_replicas(cont, n_replicas):
+            vivo = docker("inspect", "-f", "{{.Image}}", n).stdout.strip()
+            if vivo:
+                docker("tag", vivo, f"{base}:previo")
 
-    if ruta:
         r = docker("load", "-i", ruta)
         os.remove(ruta)
         if r.returncode:
             morir(f"docker load fallo: {r.stderr.strip()[:300]}")
 
-    if existe(cont):
-        docker("stop", "-t", "20", cont)
-        docker("rename", cont, viejo)
-    else:
-        print("no hay contenedor previo: despliegue inicial")
-
-    r = arrancar(cfg, cont, tag)
-    if r.returncode:
-        print(f"docker run fallo: {r.stderr.strip()[:300]}", file=sys.stderr)
-        rollback(cfg, cont, viejo)
-        sys.exit(1)
-
-    if not esperar(cfg, cont):
-        print("!! health check fallo", file=sys.stderr)
-        print("── ultimas 150 lineas ──", file=sys.stderr)
-        lg = docker("logs", "--tail", "150", cont)
-        print((lg.stdout or "")[-6000:], file=sys.stderr)
-        print((lg.stderr or "")[-6000:], file=sys.stderr)
-        if not existe(viejo):
-            log(f"SIN HEALTH PERO VIVO {cont}: primer despliegue sin version "
-                f"anterior; el contenedor queda corriendo")
-            print("!! primer despliegue sin version anterior: el contenedor "
-                  "queda corriendo para inspeccion. Usa 'estado' y 'registro' "
-                  "para ver si termino de arrancar.", file=sys.stderr)
+        todo_ok = True
+        for i, n in enumerate(nombres_replicas(cont, n_replicas), start=1):
+            print(f"── replica {i}/{n_replicas}: {n} ──")
+            if not desplegar_una(cfg, n, tag, base, publicar=(i == 1)):
+                todo_ok = False
+        if not todo_ok:
             sys.exit(1)
-        rollback(cfg, cont, viejo)
-        sys.exit(1)
 
-    if cfg["tipo"] == "front" and not asegurar_dns(cfg, cont):
-        if accion == "desplegar" and existe(viejo):
-            print("!! nombre sin resolver tras el deploy; restaurando la "
-                  "version anterior", file=sys.stderr)
-            rollback(cfg, cont, viejo)
-        else:
-            log(f"SIN DNS {cont}: el contenedor quedo corriendo "
-                f"(accion={accion})")
-            print(f"!! {cont} esta sano por IP pero su nombre no resuelve "
-                  f"en {RED}: nginx responderia 502. Reintenta el deploy.",
+        purgar(base, tag.split(":", 1)[1], cfg["conservar"])
+        pts = ",".join(f"{h}:{d}" for h, d in cfg["puertos"]) or "-"
+        log(f"{accion} {cont} tipo={cfg['tipo']} tag={tag} sha256={sha} "
+            f"replicas={n_replicas} mem={cfg['mem']} cpus={cfg['cpus']} "
+            f"puertos={pts}")
+        print(f"OK {cont} running  tipo={cfg['tipo']}  tag={tag}  sha256:{sha}"
+              f"  replicas={n_replicas}")
+        return
+
+    # accion == "revertir": replica por replica, con su config guardada.
+    nombres = [n for n in nombres_replicas(cont, 4) if existe(n)]
+    if not nombres:
+        morir(f"no existe el contenedor {cont} (ni replicas)")
+    for n in nombres:
+        cfg = cargar_cfg(n)
+        actual = docker("inspect", "-f", "{{.Config.Image}}", n).stdout.strip()
+        base = actual.split(":")[0]
+        tag = f"{base}:previo"
+        if docker("image", "inspect", tag).returncode:
+            morir(f"no hay imagen previa guardada ({tag}) para {n}")
+        print(f"── revertir {n} -> {tag} ──")
+        publicar = (n == cont)
+        viejo = f"{n}_old"
+        if existe(viejo):
+            docker("rm", "-f", viejo)
+        docker("stop", "-t", "20", n)
+        docker("rename", n, viejo)
+        r = arrancar(cfg, n, tag, publicar)
+        if r.returncode:
+            print(f"docker run fallo al revertir {n}: {r.stderr.strip()[:300]}",
                   file=sys.stderr)
-        sys.exit(1)
-
-    if existe(viejo):
-        docker("rm", "-f", viejo)
-
-    if accion == "desplegar":
-        guardar_cfg(cont, cfg)
-
-    purgar(base, tag.split(":", 1)[1], cfg["conservar"])
-    pts = ",".join(f"{h}:{d}" for h, d in cfg["puertos"]) or "-"
-    log(f"{accion} {cont} tipo={cfg['tipo']} tag={tag} sha256={sha} "
-        f"mem={cfg['mem']} cpus={cfg['cpus']} puertos={pts}")
-    print(f"OK {cont} running  tipo={cfg['tipo']}  tag={tag}  sha256:{sha}")
+            docker("rename", viejo, n)
+            docker("start", n)
+            sys.exit(1)
+        if esperar(cfg, n, publicar):
+            if existe(viejo):
+                docker("rm", "-f", viejo)
+            if cfg.get("tipo") == "front" and not asegurar_dns(cfg, n):
+                print(f"!! nombre sin resolver tras revertir {n}", file=sys.stderr)
+                sys.exit(1)
+            log(f"REVERTIR OK {n}")
+            print(f"OK revertido {n} -> {tag}")
+        else:
+            log(f"REVERTIR FALLIDO {n}")
+            print(f"!! revertir fallo en {n} (health); el contenedor queda "
+                  f"corriendo para inspeccion", file=sys.stderr)
+            sys.exit(1)
 
 
 if __name__ == "__main__":
