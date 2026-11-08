@@ -15,6 +15,7 @@ De donde sale cada cosa
 -----------------------
 Del PIPELINE (devops/vars/<entorno>.vars.yml, via los pares clave=valor):
     tipo puertos env mem reserva cpus pids java_opts salud reintentos conservar
+    replicas (1..4, opcional; las replicas 2..N no publican puertos)
 
 Del REGISTRO (servicios.yaml, SOLO para tipo=back):
     que el servicio este declarado. Nada de construccion: servicios.yaml es
